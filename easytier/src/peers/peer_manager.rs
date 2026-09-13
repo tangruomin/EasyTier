@@ -624,6 +624,38 @@ impl PeerManager {
         }
     }
 
+    /// peer 是否在线：存在直接连接，或存在中继会话，或 peer 对象仍有存活的连接。
+    ///
+    /// OSPF 路由表反映的是网络拓扑而非会话存活，出口节点离线后其表项不会立即撤销，
+    /// 因此出口选择必须额外校验本方法，否则会把流量继续发给已离线的出口节点形成黑洞。
+    fn is_peer_online(&self, peer_id: PeerId) -> bool {
+        if self.has_directly_connected_conn(peer_id) {
+            return true;
+        }
+        if self.relay_peer_map.has_session(peer_id) {
+            return true;
+        }
+        self.peers
+            .get_peer_by_id(peer_id)
+            .map(|peer| peer.has_live_conns())
+            .unwrap_or(false)
+    }
+
+    /// 判断配置的出口节点当前是否在线（能解析到 peer，且该 peer 的会话仍存活）。
+    ///
+    /// 出口选择（`get_msg_dst_peer_ipv4` / `get_msg_dst_peer_ipv6`）与默认路由的
+    /// 撤回（`ProxyCidrsMonitor::diff_proxy_cidrs`）共用本方法，以保证两处判定一致。
+    pub async fn is_exit_node_online(&self, exit_node: &IpAddr) -> bool {
+        let peer_id = match exit_node {
+            IpAddr::V4(ipv4) => self.peers.get_peer_id_by_ipv4(ipv4).await,
+            IpAddr::V6(ipv6) => self.peers.get_peer_id_by_ipv6(ipv6).await,
+        };
+        match peer_id {
+            Some(peer_id) => self.is_peer_online(peer_id),
+            None => false,
+        }
+    }
+
     #[tracing::instrument]
     pub async fn try_direct_connect<C>(&self, connector: C) -> Result<(PeerId, PeerConnId), Error>
     where
@@ -1600,6 +1632,16 @@ impl PeerManager {
                     continue;
                 };
                 if let Some(peer_id) = self.peers.get_peer_id_by_ipv4(exit_node).await {
+                    // 跳过已离线的出口节点，按配置顺序继续寻找下一个可用出口。
+                    // 全部出口都离线时 dst_peers 为空，上层会丢弃该包，
+                    // 同时 ProxyCidrsMonitor 会撤回 TUN 默认路由回退直连。
+                    if !self.is_peer_online(peer_id) {
+                        tracing::warn!(
+                            ?exit_node,
+                            "exit node is offline, try the next one in exit_nodes"
+                        );
+                        continue;
+                    }
                     dst_peers.push(peer_id);
                     is_exit_node = true;
                     break;
@@ -1639,6 +1681,14 @@ impl PeerManager {
                     continue;
                 };
                 if let Some(peer_id) = self.peers.get_peer_id_by_ipv6(exit_node).await {
+                    // 同 IPv4：跳过已离线的出口节点，继续按配置顺序寻找下一个可用出口
+                    if !self.is_peer_online(peer_id) {
+                        tracing::warn!(
+                            ?exit_node,
+                            "exit node is offline, try the next one in exit_nodes"
+                        );
+                        continue;
+                    }
                     dst_peers.push(peer_id);
                     is_exit_node = true;
                     break;

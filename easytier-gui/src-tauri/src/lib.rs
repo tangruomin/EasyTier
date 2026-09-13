@@ -1025,8 +1025,29 @@ mod manager {
                                     Ok(easytier::common::global_ctx::GlobalCtxEvent::DhcpIpv4Changed(_, _)) => {
                                         let _ = app_clone.emit("dhcp_ip_changed", &instance_id_str);
                                     }
-                                    Ok(easytier::common::global_ctx::GlobalCtxEvent::ProxyCidrsUpdated(_, _)) => {
-                                        let _ = app_clone.emit("proxy_cidrs_updated", &instance_id_str);
+                                    Ok(easytier::common::global_ctx::GlobalCtxEvent::ProxyCidrsUpdated(added, removed)) => {
+                                        // 把 added/removed 一并下发：Android 侧需要据此判断全局出口
+                                        // 默认路由 0.0.0.0/0 是否仍然生效，从而在出口节点全部离线时
+                                        // 撤回 VPN 默认路由、回退本机直连（否则会持续黑洞断网）。
+                                        #[derive(serde::Serialize)]
+                                        struct ProxyCidrsUpdatedPayload {
+                                            instance_id: String,
+                                            added: Vec<String>,
+                                            removed: Vec<String>,
+                                        }
+
+                                        let payload = ProxyCidrsUpdatedPayload {
+                                            instance_id: instance_id_str.clone(),
+                                            added: added
+                                                .iter()
+                                                .map(|cidr| cidr.to_string())
+                                                .collect(),
+                                            removed: removed
+                                                .iter()
+                                                .map(|cidr| cidr.to_string())
+                                                .collect(),
+                                        };
+                                        let _ = app_clone.emit("proxy_cidrs_updated", &payload);
                                     }
                                     Ok(_) => {}
                                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {

@@ -24,6 +24,38 @@ const curVpnStatus: vpnStatus = {
   dns: undefined,
 }
 
+/** 全局出口默认路由网段。 */
+const DEFAULT_ROUTE_CIDR = '0.0.0.0/0'
+
+/**
+ * 后端当前是否安装了全局出口默认路由（0.0.0.0/0）。
+ *
+ * 由 proxy_cidrs_updated 事件维护：出口节点全部离线时后端会撤回 0.0.0.0/0
+ * （出现在 removed 中），任一出口节点恢复在线时会重新安装（出现在 added 中）。
+ * 默认 true 以保持 2.6.4 的既有行为，首个事件到达后即被纠正。
+ */
+let exitDefaultRouteActive = true
+
+/** 判断网段字符串是否为默认路由。 */
+function isDefaultRouteCidr(cidr: string): boolean {
+  const normalized = cidr.trim()
+  return normalized === DEFAULT_ROUTE_CIDR || normalized === '0/0'
+}
+
+/**
+ * 根据后端下发的代理网段增删，同步「全局出口默认路由是否生效」。
+ *
+ * 由 event.ts 通过 composables 自动导入调用（见 vite.config.ts 的 AutoImport.dirs）。
+ */
+export function applyProxyCidrsChange(added?: string[], removed?: string[]) {
+  if (added?.some(isDefaultRouteCidr)) {
+    exitDefaultRouteActive = true
+  }
+  if (removed?.some(isDefaultRouteCidr)) {
+    exitDefaultRouteActive = false
+  }
+}
+
 async function requestVpnPermission() {
   console.log('prepare vpn')
   const prepare_ret = await prepare_vpn()
@@ -45,6 +77,8 @@ function resetVpnConfigStatus() {
   curVpnStatus.ipv4Cidr = undefined
   curVpnStatus.routes = []
   curVpnStatus.dns = undefined
+  // 复位出口默认路由状态，避免切换/重启网络实例后沿用上一次的旧状态
+  exitDefaultRouteActive = true
 }
 
 function syncVpnStatusFromNative(status: Awaited<ReturnType<typeof get_vpn_status>>) {
@@ -179,6 +213,13 @@ function getRoutesForVpn(routes: Route[], node_config: NetworkTypes.NetworkConfi
   }
 
   node_config.routes.forEach(r => {
+    // 全局出口默认路由只在后端仍安装它时才下发。出口节点全部离线时后端会撤回
+    // 0.0.0.0/0，这里必须同步剔除，否则 Android 会把公网流量继续送进隧道形成
+    // 黑洞、无法回退本机直连。
+    if (isDefaultRouteCidr(r) && !exitDefaultRouteActive) {
+      console.info('skip default route in vpn because all exit nodes are offline')
+      return
+    }
     ret.push(r)
   })
 

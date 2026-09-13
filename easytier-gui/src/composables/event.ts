@@ -8,6 +8,13 @@ interface StoredGuiConfig {
     source?: 'user' | 'webhook' | 'legacy'
 }
 
+/** 后端 proxy_cidrs_updated 事件负载；added/removed 为本次增删的代理网段。 */
+interface ProxyCidrsUpdatedPayload {
+    instance_id: string
+    added?: string[]
+    removed?: string[]
+}
+
 const EVENTS = Object.freeze({
     SAVE_CONFIGS: 'save_configs',
     PRE_RUN_NETWORK_INSTANCE: 'pre_run_network_instance',
@@ -84,9 +91,18 @@ async function onDhcpIpChanged(event: Event<unknown>) {
 }
 
 async function onProxyCidrsUpdated(event: Event<unknown>) {
-    const instanceId = normalizeInstanceIdPayload(event.payload)
+    // 新格式为 { instance_id, added, removed }；同时兼容旧的「直接下发 instance id」格式
+    const payload = event.payload
+    const payloadObj = (payload !== null && typeof payload === 'object')
+        ? payload as ProxyCidrsUpdatedPayload
+        : undefined
+    const instanceId = normalizeInstanceIdPayload(payloadObj ? payloadObj.instance_id : payload)
     console.log(`Received event '${EVENTS.PROXY_CIDRS_UPDATED}' for instance: ${instanceId}`);
     if (type() === 'android') {
+        // 先同步「全局出口默认路由是否仍生效」，再据此重算 VpnService 路由表
+        if (payloadObj) {
+            applyProxyCidrsChange(payloadObj.added, payloadObj.removed)
+        }
         await onNetworkInstanceChange(instanceId);
     }
 }
