@@ -157,6 +157,10 @@ impl From<RouteMessage> for Route {
     }
 }
 
+/// easytier 未显式指定 metric 时，非默认路由沿用的固定 metric
+/// （保持与 2.6.4 一致，避免回归普通子网代理场景）。
+const LEGACY_IPV4_ROUTE_METRIC: u32 = 65535;
+
 pub struct NetlinkIfConfiger {}
 
 impl NetlinkIfConfiger {
@@ -372,6 +376,64 @@ impl NetlinkIfConfiger {
         Self::list_route_messages(AddressFamily::Inet)
     }
 
+    /// 为默认路由（`0.0.0.0/0`）计算一个能胜过系统物理默认路由的 metric（priority）。
+    ///
+    /// Linux 在 main 表中对相同前缀的默认路由按 priority 数值小者优先，
+    /// 因此取其他默认路由的最小 priority 再减 1（无其他默认路由时取 1）。
+    /// `exclude_ifindex` 排除 easytier 自己的 TUN，避免自身已安装的低 metric 路由污染计算。
+    fn winning_ipv4_default_route_priority(exclude_ifindex: u32) -> u32 {
+        let routes = match Self::list_routes() {
+            Ok(routes) => routes,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "failed to list existing routes, fallback to legacy metric"
+                );
+                return LEGACY_IPV4_ROUTE_METRIC;
+            }
+        };
+
+        let mut min_priority: Option<u32> = None;
+        for msg in routes {
+            let route: Route = msg.into();
+            if route.table != RouteHeader::RT_TABLE_MAIN
+                || route.prefix != 0
+                || route.destination != IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                || route.ifindex == Some(exclude_ifindex)
+            {
+                continue;
+            }
+
+            // 未携带 RTA_PRIORITY 的默认路由，内核实为 metric 0
+            let priority = route.metric.unwrap_or(0);
+            min_priority = Some(min_priority.map_or(priority, |cur| cur.min(priority)));
+        }
+
+        match min_priority {
+            // 物理默认路由使用隐式 metric 0 时，已无法再安装更小的 metric
+            Some(0) => {
+                tracing::warn!(
+                    "physical default route uses implicit metric 0, the TUN default route cannot \
+                     win by metric; please set a non-zero metric on the physical default route"
+                );
+                0
+            }
+            Some(min) => {
+                tracing::info!(
+                    min,
+                    "computed TUN default route metric to beat the physical default route"
+                );
+                min - 1
+            }
+            None => {
+                tracing::info!(
+                    "no other default route found, install TUN default route with the lowest metric"
+                );
+                1
+            }
+        }
+    }
+
     pub(crate) fn list_ipv6_route_messages() -> Result<Vec<RouteMessage>, Error> {
         Self::list_route_messages(AddressFamily::Inet6)
     }
@@ -386,6 +448,20 @@ impl IfConfiguerTrait for NetlinkIfConfiger {
         cidr_prefix: u8,
         cost: Option<i32>,
     ) -> Result<(), Error> {
+        let ifindex = NetlinkIfConfiger::get_interface_index(name)?;
+
+        // 显式 cost 沿用调用方指定值；
+        // 普通路由保持 2.6.4 原有 metric，避免影响仅做子网代理的场景；
+        // 仅默认路由（0.0.0.0/0，即 routes=["0.0.0.0/0"] 的全局出口场景）动态计算 metric，
+        // 保证其 priority 小于物理默认路由，从而真正胜出。
+        let priority = match cost {
+            Some(cost) => cost as u32,
+            None if cidr_prefix == 0 => {
+                NetlinkIfConfiger::winning_ipv4_default_route_priority(ifindex)
+            }
+            None => LEGACY_IPV4_ROUTE_METRIC,
+        };
+
         let mut message = RouteMessage::default();
 
         message.header.table = RouteHeader::RT_TABLE_MAIN;
@@ -394,15 +470,9 @@ impl IfConfiguerTrait for NetlinkIfConfiger {
         message.header.kind = RouteType::Unicast;
         message.header.address_family = AddressFamily::Inet;
         // metric
-        message
-            .attributes
-            .push(RouteAttribute::Priority(cost.unwrap_or(65535) as u32));
+        message.attributes.push(RouteAttribute::Priority(priority));
         // output interface
-        message
-            .attributes
-            .push(RouteAttribute::Oif(NetlinkIfConfiger::get_interface_index(
-                name,
-            )?));
+        message.attributes.push(RouteAttribute::Oif(ifindex));
         // source address
         message.header.destination_prefix_length = cidr_prefix;
         message

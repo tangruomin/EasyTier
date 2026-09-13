@@ -195,10 +195,20 @@ impl IfConfiguerTrait for WindowsIfConfiger {
             anyhow::anyhow!("Failed to get interface luid: {}", format_win_error(e))
         })?;
 
+        // 显式 cost 沿用调用方指定值（例如魔法 DNS 伪 IP 的主机路由 cost=4）；
+        // 普通路由保持 2.6.4 原有跃点，避免影响仅做子网代理的场景；
+        // 仅默认路由（0.0.0.0/0，即 routes=["0.0.0.0/0"] 的全局出口场景）动态计算跃点，
+        // 保证其总跃点（接口跃点 + 路由跃点）严格小于物理默认路由，从而真正胜出。
+        let metric = match cost {
+            Some(cost) => cost as u32,
+            None if cidr_prefix == 0 => luid.winning_ipv4_default_route_metric(),
+            None => InterfaceLuid::LEGACY_ROUTE_METRIC,
+        };
+
         luid.add_routes_ipv4([RouteDataIpv4 {
             destination: Ipv4Inet::new(address, cidr_prefix).unwrap(),
             next_hop: Ipv4Addr::UNSPECIFIED,
-            metric: cost.unwrap_or(9000) as u32,
+            metric,
         }])
         .map_err(|e| anyhow::anyhow!("Failed to add route: {}", format_win_error(e)))?;
         Ok(())
