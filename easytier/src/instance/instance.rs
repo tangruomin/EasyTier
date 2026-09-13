@@ -1096,6 +1096,23 @@ impl Instance {
 
         self.add_initial_peers().await?;
 
+        // 出口节点需要为客户端提供魔法 DNS 上游解析：客户端把非虚拟网域名的查询经隧道
+        // 交给出口节点，由出口节点用自身（通常在海外的、干净的）系统 DNS 解析后回传，
+        // 避免客户端本机上游 DNS 被污染 / 被劫持而解析到假 IP。
+        #[cfg(feature = "magic-dns")]
+        if self.global_ctx.enable_exit_node() {
+            self.peer_manager
+                .get_peer_rpc_mgr()
+                .rpc_server()
+                .registry()
+                .register(
+                    crate::proto::peer_rpc::MagicDnsForwardRpcServer::new(
+                        super::dns_server::forward_rpc::MagicDnsForwardService,
+                    ),
+                    &self.global_ctx.get_network_name(),
+                );
+        }
+
         let monitor = super::proxy_cidrs_monitor::ProxyCidrsMonitor::new(
             self.peer_manager.clone(),
             self.global_ctx.clone(),
