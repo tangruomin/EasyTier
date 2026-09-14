@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use hickory_proto::op::Edns;
 use hickory_proto::rr;
 use hickory_proto::rr::LowerName;
-use hickory_resolver::config::ResolverOpts;
+use hickory_proto::xfer::Protocol;
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::system_conf::read_system_conf;
 use hickory_server::ServerFuture;
@@ -19,9 +20,23 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::task::JoinSet;
 
-use crate::common::dns::get_default_resolver_config;
-
 use super::config::{GeneralConfig, Record, RunConfig};
+
+/// 读不到系统 DNS 配置时使用的默认上游。
+///
+/// 刻意**不使用** `crate::common::dns::get_default_resolver_config()`
+/// （其值为 `223.5.5.5` / `180.184.1.1` 等国内 DNS）：在「出口节点在海外」的魔法 DNS
+/// 场景下，国内 DNS 会对被墙域名返回污染结果，正是本问题要避免的。
+fn default_forward_resolver_config() -> ResolverConfig {
+    let mut config = ResolverConfig::new();
+    for server in ["8.8.8.8:53", "1.1.1.1:53"] {
+        config.add_name_server(NameServerConfig::new(
+            server.parse().unwrap(),
+            Protocol::Udp,
+        ));
+    }
+    config
+}
 
 pub struct Server {
     server: ServerFuture<CatalogRequestHandler>,
@@ -89,8 +104,8 @@ impl Server {
         }
 
         // use forwarder authority for the root zone
-        let system_conf =
-            read_system_conf().unwrap_or((get_default_resolver_config(), ResolverOpts::default()));
+        let system_conf = read_system_conf()
+            .unwrap_or((default_forward_resolver_config(), ResolverOpts::default()));
         let forward_config = ForwardConfig {
             name_servers: system_conf
                 .0

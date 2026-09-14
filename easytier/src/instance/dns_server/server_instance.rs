@@ -54,7 +54,9 @@ use pnet::packet::{
 };
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Mutex;
-use std::{collections::BTreeMap, io, net::Ipv4Addr, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap, io, net::Ipv4Addr, str::FromStr, sync::Arc, sync::Weak, time::Duration,
+};
 
 static NIC_PIPELINE_NAME: &str = "magic_dns_server";
 
@@ -64,6 +66,13 @@ pub(super) struct MagicDnsServerInstanceData {
     tun_ip: Ipv4Addr,
     fake_ip: Ipv4Addr,
     my_peer_id: PeerId,
+
+    /// 本节点的 peer manager（弱引用，避免与 nic packet pipeline 互相持有形成循环）
+    peer_mgr: Weak<PeerManager>,
+
+    /// 配置的虚拟网 DNS 区域名（如 `et.net.`）。
+    /// 用于区分「本地权威解析」与「交给出口节点解析」。
+    tld_dns_zone: String,
 
     // zone -> (tunnel remote addr -> route)
     route_infos: DashMap<String, MultiMap<url::Url, Route>>,
@@ -289,6 +298,28 @@ impl ResponseHandler for ResponseWrapper {
 }
 
 impl MagicDnsServerInstanceData {
+    /// 判断查询名是否属于本节点的虚拟网 DNS 区域（例如 `node-a.et.net.`）。
+    ///
+    /// 属于该区域的查询由本地权威记录（`InMemoryAuthority`）应答；
+    /// 其余查询才需要交给出口节点解析。
+    fn is_local_dns_zone_name(request: &Request, zone: &str) -> bool {
+        let zone = zone.trim();
+        if zone.is_empty() {
+            return false;
+        }
+
+        let suffix = if zone.ends_with('.') {
+            zone.to_string()
+        } else {
+            format!("{}.", zone)
+        };
+        request
+            .queries()
+            .first()
+            .map(|query| query.name().to_string().ends_with(&suffix))
+            .unwrap_or(false)
+    }
+
     /// Replace content of incoming UDP DNS request and ICMP echo request packet with reply data,
     /// and swap source and destination IP addresses to send it back.
     async fn handle_ip_packet(&self, zc_packet: &mut ZCPacket) -> Option<()> {
@@ -344,7 +375,7 @@ impl MagicDnsServerInstanceData {
         src_ip: Ipv4Addr,
         dst_ip: Ipv4Addr,
     ) -> Option<()> {
-        let (src_port, dst_port, request, request_length) = {
+        let (src_port, dst_port, request, request_length, query_bytes) = {
             let udp_packet = UdpPacket::new(&zc_packet.payload()[ip_header_length..])?;
 
             let src_port = udp_packet.get_source();
@@ -366,24 +397,45 @@ impl MagicDnsServerInstanceData {
                     hickory_proto::xfer::Protocol::Udp,
                 ),
                 request_payload.len(),
+                request_payload.to_vec(),
             )
         };
 
         let response_payload = {
-            let response_payload_arc = Arc::new(Mutex::new(Vec::with_capacity(512)));
+            // 非虚拟网域名（非 `.et.net.`）优先经隧道交给出口节点解析：
+            // 出口节点通常在海外、其系统 DNS 干净，可避免本机上游 DNS 被污染 / 被劫持而
+            // 解析到假 IP（Android 上尤为明显，因为 easytier 自身 socket 不经隧道）。
+            // 出口节点不可用或解析失败时，回退到本机上游转发（保持 2.6.4 行为）。
+            let exit_node_response = if Self::is_local_dns_zone_name(&request, &self.tld_dns_zone) {
+                None
+            } else {
+                match self.peer_mgr.upgrade() {
+                    Some(peer_mgr) => {
+                        super::forward_rpc::resolve_dns_via_exit_node(&peer_mgr, &query_bytes).await
+                    }
+                    None => None,
+                }
+            };
 
-            self.dns_server
-                .read_catalog()
-                .await
-                .handle_request(
-                    &request,
-                    ResponseWrapper {
-                        response: response_payload_arc.clone(),
-                    },
-                )
-                .await;
+            match exit_node_response {
+                Some(payload) => payload,
+                None => {
+                    let response_payload_arc = Arc::new(Mutex::new(Vec::with_capacity(512)));
 
-            Arc::into_inner(response_payload_arc)?.into_inner().ok()?
+                    self.dns_server
+                        .read_catalog()
+                        .await
+                        .handle_request(
+                            &request,
+                            ResponseWrapper {
+                                response: response_payload_arc.clone(),
+                            },
+                        )
+                        .await;
+
+                    Arc::into_inner(response_payload_arc)?.into_inner().ok()?
+                }
+            }
         };
 
         let response_length = response_payload.len();
@@ -541,12 +593,24 @@ impl MagicDnsServerInstance {
                 .await?;
         }
 
+        // Use configured tld_dns_zone or fall back to DEFAULT_ET_DNS_ZONE if empty
+        let tld_dns_zone_clone = peer_mgr
+            .get_global_ctx()
+            .config
+            .get_flags()
+            .tld_dns_zone
+            .clone();
+
         let data = Arc::new(MagicDnsServerInstanceData {
             dns_server,
             tun_dev: tun_dev.clone(),
             tun_ip: tun_inet.address(),
             fake_ip,
             my_peer_id: peer_mgr.my_peer_id(),
+            // 弱引用：data 会被注册进 nic packet pipeline（由 peer manager 持有），
+            // 若这里持 Arc<PeerManager> 会与 peer manager 形成引用环，导致无法释放。
+            peer_mgr: Arc::downgrade(&peer_mgr),
+            tld_dns_zone: tld_dns_zone_clone.clone(),
             route_infos: DashMap::new(),
             system_config: get_system_config(tun_dev.as_deref())?,
         });
@@ -559,9 +623,6 @@ impl MagicDnsServerInstance {
         peer_mgr
             .add_nic_packet_process_pipeline(Box::new(data.clone()))
             .await;
-        // Use configured tld_dns_zone or fall back to DEFAULT_ET_DNS_ZONE if empty
-        let flags = peer_mgr.get_global_ctx().config.get_flags();
-        let tld_dns_zone_clone = flags.tld_dns_zone.clone();
 
         data.update_dns_records(std::iter::empty(), &tld_dns_zone_clone)
             .await

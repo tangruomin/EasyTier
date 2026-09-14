@@ -7,6 +7,8 @@ pub(crate) mod server;
 #[cfg(feature = "magic-dns")]
 pub mod client_instance;
 #[cfg(feature = "magic-dns")]
+pub(crate) mod forward_rpc;
+#[cfg(feature = "magic-dns")]
 pub mod runner;
 #[cfg(feature = "magic-dns")]
 pub mod server_instance;
