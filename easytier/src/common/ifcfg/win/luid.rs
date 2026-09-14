@@ -451,6 +451,104 @@ impl InterfaceLuid {
         }
     }
 
+    /// 未显式指定跃点时，非默认路由沿用的固定跃点
+    /// （保持与 2.6.4 一致，避免回归普通子网代理场景）。
+    pub const LEGACY_ROUTE_METRIC: u32 = 9000;
+
+    /// 返回本接口的 IPv4 接口跃点（即 `Get-NetIPInterface` 的 InterfaceMetric）。
+    pub fn ipv4_interface_metric(&self) -> u32 {
+        self.get_ip_interface(AF_INET as _)
+            .map(|row| row.Metric)
+            .unwrap_or(0)
+    }
+
+    /// 枚举系统中其他接口的 IPv4 默认路由，返回其中最小的“总跃点”。
+    ///
+    /// Windows 对同一目的前缀的多条路由按“总跃点 = 接口跃点 + 路由跃点”取最小者胜出
+    /// （即 `route print` 的 Metric 列）。`exclude_luid` 用于排除 easytier 自己的 TUN，
+    /// 避免上一次安装的低跃点默认路由污染本次计算。
+    ///
+    /// 返回 `Ok(None)` 表示系统中不存在其他默认路由。
+    pub fn min_ipv4_default_route_total_metric(
+        exclude_luid: u64,
+    ) -> Result<Option<u32>, NETIO_STATUS> {
+        let mut p_table: PMIB_IPFORWARD_TABLE2 = ptr::null_mut();
+        let result = unsafe { GetIpForwardTable2(AF_INET as _, &mut p_table) };
+        if NO_ERROR != result {
+            return Err(result);
+        }
+        assert!(!p_table.is_null());
+
+        let num_entries = unsafe { *p_table }.NumEntries;
+        let x_table = unsafe { *p_table }.Table.as_ptr();
+
+        let mut min_total: Option<u32> = None;
+        for i in 0..num_entries {
+            let entry = unsafe { &*x_table.add(i as _) };
+
+            // 只统计默认路由（目的前缀长度为 0），并排除自身接口
+            if entry.DestinationPrefix.PrefixLength != 0
+                || entry.InterfaceLuid.Value == exclude_luid
+            {
+                continue;
+            }
+
+            let total = InterfaceLuid::new(entry.InterfaceLuid.Value)
+                .ipv4_interface_metric()
+                .saturating_add(entry.Metric);
+            min_total = Some(min_total.map_or(total, |cur| cur.min(total)));
+        }
+
+        unsafe { FreeMibTable(p_table as _) };
+        Ok(min_total)
+    }
+
+    /// 为默认路由（`0.0.0.0/0`）计算一个能胜过系统物理默认路由的“路由跃点”。
+    ///
+    /// 取其他默认路由的最小总跃点，扣除本接口跃点后再减 1，使本接口安装的默认路由
+    /// 总跃点严格更小；若系统中没有其他默认路由，则使用最小跃点 1。
+    pub fn winning_ipv4_default_route_metric(&self) -> u32 {
+        let tun_if_metric = self.ipv4_interface_metric();
+        match Self::min_ipv4_default_route_total_metric(self.luid.Value) {
+            Ok(Some(min_total)) => {
+                let metric = min_total
+                    .saturating_sub(tun_if_metric)
+                    .saturating_sub(1)
+                    .max(1);
+                if tun_if_metric.saturating_add(metric) < min_total {
+                    tracing::info!(
+                        min_total,
+                        tun_if_metric,
+                        metric,
+                        "computed TUN default route metric to beat the physical default route"
+                    );
+                } else {
+                    tracing::warn!(
+                        min_total,
+                        tun_if_metric,
+                        metric,
+                        "TUN default route metric cannot beat the physical default route on this system"
+                    );
+                }
+                metric
+            }
+            Ok(None) => {
+                tracing::info!(
+                    tun_if_metric,
+                    "no other default route found, install TUN default route with the lowest metric"
+                );
+                1
+            }
+            Err(err) => {
+                tracing::warn!(
+                    err,
+                    "failed to enumerate existing default routes, fallback to legacy metric"
+                );
+                Self::LEGACY_ROUTE_METRIC
+            }
+        }
+    }
+
     /// add_route_ipv4 method adds a route to the interface. Corresponds to CreateIpForwardEntry2 function, with added splitDefault feature.
     /// (https://docs.microsoft.com/en-us/windows/desktop/api/netioapi/nf-netioapi-createipforwardentry2)
     pub fn add_route_ipv4(
