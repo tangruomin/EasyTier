@@ -11,6 +11,13 @@ use tokio_util::task::AbortOnDropHandle;
 /// 用于防抖：避免出口节点网络抖动导致 TUN 默认路由被反复增删、造成二次断网。
 const EXIT_NODE_STATE_DEBOUNCE: Duration = Duration::from_secs(5);
 
+/// 监控启动后的保护期：期间即使判定"全部出口离线"也**不撤回**默认路由。
+///
+/// 刚启动时路由表与 peer 会话可能尚未稳定，过早撤回会把公网流量全部赶到本机直连，
+/// 表现为"只能访问国内网站、连浏览器 DoH 也救不回来"（见
+/// `easytier-安卓回归与DNS链路分析.md` 第 4 节的次要候选）。
+const EXIT_WITHDRAW_GRACE: Duration = Duration::from_secs(20);
+
 /// ProxyCidrsMonitor monitors changes in proxy CIDRs from peer routes
 /// and emits GlobalCtxEvent::ProxyCidrsUpdated with added/removed diffs.
 pub struct ProxyCidrsMonitor {
@@ -49,10 +56,14 @@ impl ProxyCidrsMonitor {
     /// 全局出口场景（manual routes 含 `0.0.0.0/0` 且配置了 `exit_nodes`）下，默认路由
     /// 只在「至少一个出口节点在线」时才计入，否则从结果中移除，使 TUN 默认路由被撤回、
     /// 公网流量回退本机直连，避免出口节点离线后形成黑洞导致整机断网。
+    ///
+    /// `allow_withdraw_default_route` 为 `false` 时不做撤回（用于启动保护期，
+    /// 避免刚启动、peer 会话还没稳定时把公网流量误判成"出口全部离线"而赶到直连）。
     pub async fn diff_proxy_cidrs(
         peer_mgr: &PeerManager,
         global_ctx: &ArcGlobalCtx,
         cur_proxy_cidrs: &BTreeSet<cidr::Ipv4Cidr>,
+        allow_withdraw_default_route: bool,
     ) -> (
         BTreeSet<cidr::Ipv4Cidr>,
         Vec<cidr::Ipv4Cidr>,
@@ -64,7 +75,8 @@ impl ProxyCidrsMonitor {
 
             // 仅对「routes 含 0.0.0.0/0 且配置了 exit_nodes」的全局出口场景生效；
             // 普通 -n 子网代理不参与出口存活判定，行为保持 2.6.4 现状。
-            if !global_ctx.config.get_exit_nodes().is_empty()
+            if allow_withdraw_default_route
+                && !global_ctx.config.get_exit_nodes().is_empty()
                 && !Self::any_exit_node_online(peer_mgr, global_ctx).await
             {
                 let before = proxy_cidrs.len();
@@ -110,6 +122,7 @@ impl ProxyCidrsMonitor {
             // `exit_online` 为当前生效值，`pending` 记录待确认的新状态及其起始时刻。
             let mut exit_online = true;
             let mut pending: Option<(bool, Instant)> = None;
+            let monitor_started_at = Instant::now();
 
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -150,19 +163,33 @@ impl ProxyCidrsMonitor {
                             match pending {
                                 Some((pending_state, since)) if pending_state == observed => {
                                     if since.elapsed() >= EXIT_NODE_STATE_DEBOUNCE {
-                                        exit_online = observed;
-                                        pending = None;
-                                        if observed {
+                                        // 启动保护期内不撤回默认路由：刚启动时路由表 / peer 会话
+                                        // 可能还没稳定，过早撤回会把公网流量全部赶到本机直连，
+                                        // 表现为"只能访问国内网站"（详见安卓回归分析文档 4 节）。
+                                        if !observed
+                                            && monitor_started_at.elapsed() < EXIT_WITHDRAW_GRACE
+                                        {
                                             tracing::info!(
-                                                "exit node is online again, restore exit node mode"
+                                                "all exit nodes look offline but still within the \
+                                                 startup grace period, keep the default route"
                                             );
+                                            false
                                         } else {
-                                            tracing::warn!(
-                                                "all exit nodes are offline, fall back to direct \
-                                                 connection"
-                                            );
+                                            exit_online = observed;
+                                            pending = None;
+                                            if observed {
+                                                tracing::info!(
+                                                    "exit node is online again, restore exit node mode"
+                                                );
+                                            } else {
+                                                tracing::warn!(
+                                                    exit_nodes = ?self.global_ctx.config.get_exit_nodes(),
+                                                    "all exit nodes are offline, fall back to direct \
+                                                     connection"
+                                                );
+                                            }
+                                            true
                                         }
-                                        true
                                     } else {
                                         false
                                     }
@@ -180,9 +207,13 @@ impl ProxyCidrsMonitor {
                     continue;
                 }
 
-                let (new_proxy_cidrs, added, removed) =
-                    Self::diff_proxy_cidrs(peer_mgr.as_ref(), &self.global_ctx, &cur_proxy_cidrs)
-                        .await;
+                let (new_proxy_cidrs, added, removed) = Self::diff_proxy_cidrs(
+                    peer_mgr.as_ref(),
+                    &self.global_ctx,
+                    &cur_proxy_cidrs,
+                    monitor_started_at.elapsed() >= EXIT_WITHDRAW_GRACE,
+                )
+                .await;
 
                 cur_proxy_cidrs = new_proxy_cidrs;
 

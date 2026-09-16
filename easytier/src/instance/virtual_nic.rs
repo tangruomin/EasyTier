@@ -528,7 +528,7 @@ impl VirtualNic {
         {
             let dev_name = self.global_ctx.get_flags().dev_name;
 
-            match crate::arch::windows::add_self_to_firewall_allowlist() {
+            match crate::arch::windows::add_self_to_firewall_allowlist_with_ctx(&self.global_ctx) {
                 Ok(_) => tracing::info!("add_self_to_firewall_allowlist successful!"),
                 Err(error) => {
                     log::warn!(%error, "Failed to add Easytier to firewall allowlist, Subnet proxy and KCP proxy may not work properly.");
@@ -1146,6 +1146,7 @@ impl NicCtx {
                 peer_mgr.as_ref(),
                 &global_ctx,
                 &cur_proxy_cidrs,
+                true,
             )
             .await;
             Self::apply_route_changes(
@@ -1175,6 +1176,7 @@ impl NicCtx {
                             peer_mgr.as_ref(),
                             &global_ctx,
                             &cur_proxy_cidrs,
+                            true,
                         )
                         .await;
                         GlobalCtxEvent::ProxyCidrsUpdated(added, removed)
