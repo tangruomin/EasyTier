@@ -832,6 +832,18 @@ impl NetworkConfig {
             flags.accept_dns = enable_magic_dns;
         }
 
+        if let Some(dns_mode) = &self.dns_mode {
+            flags.dns_mode = dns_mode.clone();
+        }
+
+        if !self.dns_servers.is_empty() {
+            flags.dns_servers = self.dns_servers.clone();
+        }
+
+        if let Some(disable_exit_dns) = self.disable_exit_dns {
+            flags.disable_exit_dns = disable_exit_dns;
+        }
+
         if let Some(mtu) = self.mtu {
             flags.mtu = mtu as u32;
         }
@@ -1002,6 +1014,9 @@ impl NetworkConfig {
         result.enable_udp_broadcast_relay = Some(flags.enable_udp_broadcast_relay);
         result.disable_sym_hole_punching = Some(flags.disable_sym_hole_punching);
         result.enable_magic_dns = Some(flags.accept_dns);
+        result.dns_mode = Some(flags.dns_mode.clone());
+        result.dns_servers = flags.dns_servers.clone();
+        result.disable_exit_dns = Some(flags.disable_exit_dns);
         result.mtu = Some(flags.mtu as i32);
         result.instance_recv_bps_limit =
             (flags.instance_recv_bps_limit != u64::MAX).then_some(flags.instance_recv_bps_limit);

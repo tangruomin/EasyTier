@@ -101,6 +101,13 @@ message NetworkConfig {
   optional string ipv6_public_addr_prefix = 64;
   optional bool disable_relay_data = 65;
   optional bool enable_udp_broadcast_relay = 66;
+
+  // DNS 上游模式：auto（默认）/ custom / exit-node
+  optional string dns_mode = 67;
+  // dns_mode = custom 时使用的 DNS 服务器列表
+  repeated string dns_servers = 68;
+  // 出口节点是否禁止提供隧道内 DNS 服务（默认 false，即默认提供）
+  optional bool disable_exit_dns = 69;
 }
 
 message PortForwardConfig {

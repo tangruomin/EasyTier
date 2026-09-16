@@ -73,6 +73,112 @@ pub fn gen_default_flags() -> Flags {
         disable_upnp: false,
         disable_relay_data: false,
         enable_udp_broadcast_relay: false,
+        dns_mode: DnsMode::Auto.to_string(),
+        dns_servers: Vec::new(),
+        disable_exit_dns: false,
+    }
+}
+
+/// DNS 上游模式（`--dns-mode` / `flags.dns_mode`）。
+///
+/// 该配置决定「本节点的 DNS 查询最终交给谁解析」：
+/// - [`DnsMode::Auto`]：默认值。存在在线出口节点时使用出口节点提供的 DNS 服务
+///   （隧道内虚拟 IP:53），否则保持本机系统 DNS 行为不变；
+/// - [`DnsMode::Custom`]：使用 `flags.dns_servers` 指定的 DNS，忽略系统 DNS；
+/// - [`DnsMode::ExitNode`]：强制使用出口节点的 DNS 服务，出口不可用时回退到系统 DNS。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DnsMode {
+    #[default]
+    Auto,
+    Custom,
+    ExitNode,
+}
+
+impl DnsMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DnsMode::Auto => "auto",
+            DnsMode::Custom => "custom",
+            DnsMode::ExitNode => "exit-node",
+        }
+    }
+
+    /// 解析配置字符串；空字符串视为默认值 `auto`，无法识别时告警并回退到 `auto`。
+    pub fn from_config_str(s: &str) -> Self {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return DnsMode::Auto;
+        }
+        match trimmed.to_ascii_lowercase().as_str() {
+            "auto" => DnsMode::Auto,
+            "custom" => DnsMode::Custom,
+            "exit-node" | "exit_node" | "exitnode" => DnsMode::ExitNode,
+            other => {
+                crate::common::log::warn!(
+                    "unknown dns mode {}, fallback to auto (supported: auto/custom/exit-node)",
+                    other
+                );
+                DnsMode::Auto
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for DnsMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 解析 DNS 服务器字符串列表：允许 `1.1.1.1`（默认 53 端口）、`1.1.1.1:5353`、
+/// `[2606:4700:4700::1111]:53`。非法项打印告警后跳过。
+pub fn parse_dns_servers(servers: &[String]) -> Vec<SocketAddr> {
+    let mut ret = Vec::new();
+    for server in servers {
+        let s = server.trim();
+        if s.is_empty() {
+            continue;
+        }
+        if let Ok(addr) = s.parse::<SocketAddr>() {
+            ret.push(addr);
+            continue;
+        }
+        if let Ok(ip) = s.parse::<IpAddr>() {
+            ret.push(SocketAddr::new(ip, 53));
+            continue;
+        }
+        crate::common::log::warn!("invalid dns server {}, skipped", s);
+    }
+    ret
+}
+
+impl std::str::FromStr for DnsMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Ok(DnsMode::Auto),
+            "custom" => Ok(DnsMode::Custom),
+            "exit-node" | "exit_node" | "exitnode" => Ok(DnsMode::ExitNode),
+            other => anyhow::bail!(
+                "'{}' is not a valid dns mode, supported: auto, custom, exit-node",
+                other
+            ),
+        }
+    }
+}
+
+impl ValueEnum for DnsMode {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[DnsMode::Auto, DnsMode::Custom, DnsMode::ExitNode]
+    }
+
+    fn from_str(input: &str, _ignore_case: bool) -> Result<Self, String> {
+        input.parse::<DnsMode>().map_err(|e| e.to_string())
+    }
+
+    fn to_possible_value(&self) -> Option<PossibleValue> {
+        Some(PossibleValue::new(self.as_str()))
     }
 }
 

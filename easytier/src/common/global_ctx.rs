@@ -589,6 +589,26 @@ impl GlobalCtx {
         self.flags.load().enable_exit_node || cfg!(target_env = "ohos")
     }
 
+    /// 本节点的 DNS 上游模式（`--dns-mode`，缺省为空字符串表示 `auto`）。
+    pub fn dns_mode(&self) -> crate::common::config::DnsMode {
+        crate::common::config::DnsMode::from_config_str(&self.flags.load().dns_mode)
+    }
+
+    /// `dns_mode = custom` 时使用的 DNS 服务器列表。
+    pub fn dns_servers(&self) -> Vec<String> {
+        self.flags.load().dns_servers.clone()
+    }
+
+    /// 出口节点是否提供隧道内 DNS 服务（`--disable-exit-dns` 关闭，默认提供）。
+    pub fn exit_dns_enabled(&self) -> bool {
+        !self.flags.load().disable_exit_dns
+    }
+
+    /// 本节点是否启用 IPv6（`--disable-ipv6` 关闭）。
+    pub fn enable_ipv6_addr(&self) -> bool {
+        self.flags.load().enable_ipv6
+    }
+
     pub fn proxy_forward_by_system(&self) -> bool {
         self.flags.load().proxy_forward_by_system
     }

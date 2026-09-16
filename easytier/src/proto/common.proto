@@ -77,6 +77,18 @@ message FlagsInConfig {
   bool disable_upnp = 40;
   bool disable_relay_data = 41;
   bool enable_udp_broadcast_relay = 42;
+
+  // DNS 上游模式，取值 auto / custom / exit-node（空字符串等价于 auto）：
+  // auto      默认，存在在线出口节点时用出口节点的 DNS 服务，否则用系统 DNS
+  // custom    使用 dns_servers 指定的 DNS
+  // exit-node 强制使用出口节点的 DNS 服务（隧道内虚拟 IP:53）
+  string dns_mode = 43;
+
+  // dns_mode = custom 时使用的 DNS 服务器列表（可省略 :53 端口）
+  repeated string dns_servers = 44;
+
+  // 出口节点是否禁止提供隧道内 DNS 服务（默认 false，即出口节点默认提供）
+  bool disable_exit_dns = 45;
 }
 
 message RpcDescriptor {

@@ -226,6 +226,15 @@ core_clap:
   tld_dns_zone:
     en: "specify the top-level domain zone for magic DNS. if not provided, defaults to the value from dns_server module (et.net.). only used when accept_dns is true."
     zh-CN: "指定魔法DNS的顶级域名区域。如果未提供，默认使用dns_server模块中的值（et.net.）。仅在accept_dns为true时使用。"
+  dns_mode:
+    en: "dns upstream mode: auto (default) / custom / exit-node. auto: use the exit node's dns service when an exit node is online, otherwise keep the system dns; custom: use the dns servers given by --dns-servers; exit-node: always resolve through the exit node's dns service (virtual ip:53 inside the tunnel), which is the recommended mode behind a censored/polluted network. it selects the dns resolving path and can be combined with --accept-dns (which installs the magic dns into the system dns settings)."
+    zh-CN: "DNS 上游模式：auto（默认）/ custom / exit-node。auto：存在在线出口节点时使用出口节点提供的 DNS 服务，否则保持系统 DNS；custom：使用 --dns-servers 指定的 DNS；exit-node：始终经隧道交给出口节点的 DNS 服务（虚拟 IP:53）解析，在被墙/被污染的网络里推荐使用。本参数只决定“域名经谁解析”，可与 --accept-dns 组合使用（--accept-dns 负责把魔法 DNS 写入本机系统 DNS）。"
+  dns_servers:
+    en: "dns servers used when --dns-mode custom, e.g. 223.5.5.5,1.1.1.1:53. port 53 is used when omitted."
+    zh-CN: "当 --dns-mode custom 时使用的 DNS 服务器，例如 223.5.5.5,1.1.1.1:53；省略端口时默认 53。"
+  disable_exit_dns:
+    en: "set to true to disable the dns service that an exit node provides to clients on its virtual ip port 53. by default an exit node always serves dns to clients so that they can resolve domains through the tunnel."
+    zh-CN: "设为 true 可关闭出口节点在虚拟 IP 的 53 端口为客户端提供的 DNS 服务。默认情况下出口节点始终提供该服务，便于客户端经隧道解析域名。"
   private_mode:
     en: "if true, foreign networks are only allowed when this node can verify they use the same network secret, or when a foreign credential node is already trusted via admin-issued credential propagation; different or missing secrets are otherwise rejected."
     zh-CN: "如果为true，则仅允许两类 foreign network 接入：本节点能验证其使用相同 network secret 的节点，或已通过 foreign network 管理节点传播而被信任的 credential 节点；否则 secret 不同或缺失时会被拒绝。"

@@ -4,7 +4,7 @@ use crate::{
     ShellType,
     common::{
         config::{
-            ConfigFileControl, ConfigLoader, ConsoleLoggerConfig, EncryptionAlgorithm,
+            ConfigFileControl, ConfigLoader, ConsoleLoggerConfig, DnsMode, EncryptionAlgorithm,
             FileLoggerConfig, LoggingConfigLoader, NetworkIdentity, PeerConfig, PortForwardConfig,
             TomlConfigLoader, VpnPortalConfig, load_config_from_file, parse_mapped_listener_urls,
             process_secure_mode_cfg,
@@ -592,6 +592,32 @@ struct NetworkOptions {
     tld_dns_zone: Option<String>,
 
     #[arg(
+        long = "dns-mode",
+        env = "ET_DNS_MODE",
+        help = t!("core_clap.dns_mode").to_string(),
+        value_enum,
+    )]
+    dns_mode: Option<DnsMode>,
+
+    #[arg(
+        long = "dns-servers",
+        env = "ET_DNS_SERVERS",
+        value_delimiter = ',',
+        help = t!("core_clap.dns_servers").to_string(),
+        num_args = 0..
+    )]
+    dns_servers: Vec<String>,
+
+    #[arg(
+        long = "disable-exit-dns",
+        env = "ET_DISABLE_EXIT_DNS",
+        help = t!("core_clap.disable_exit_dns").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    disable_exit_dns: Option<bool>,
+
+    #[arg(
         long,
         env = "ET_PRIVATE_MODE",
         help = t!("core_clap.private_mode").to_string(),
@@ -1158,6 +1184,13 @@ impl NetworkOptions {
         if let Some(tld_dns_zone) = &self.tld_dns_zone {
             f.tld_dns_zone = tld_dns_zone.clone();
         }
+        if let Some(dns_mode) = self.dns_mode {
+            f.dns_mode = dns_mode.to_string();
+        }
+        if !self.dns_servers.is_empty() {
+            f.dns_servers = self.dns_servers.clone();
+        }
+        f.disable_exit_dns = self.disable_exit_dns.unwrap_or(f.disable_exit_dns);
         cfg.set_flags(f);
 
         if !self.exit_nodes.is_empty() {
