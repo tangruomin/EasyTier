@@ -37,6 +37,29 @@ use crate::{
     },
 };
 
+/// NAT 表项空闲回收超时（秒）：该时间内没有任何收发流量的表项会被回收。
+const NAT_IDLE_TIMEOUT_SECS: u64 = 180;
+
+/// 收包任务的轮询间隔。
+///
+/// 收包任务需要定期醒来检查 `stopped` 标志，这样表项被回收后才能在较短时间内
+/// 退出并释放 socket；同时它不能因为一段时间没有响应就整个退出，否则表项会变成
+/// “僵尸表项”：请求还在往外转发，但响应永远收不到，socket 也一直被占用。
+const NAT_RECV_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// udp nat 表项数量上限。
+///
+/// 每个表项的代价都不小：
+/// 1) 持有一个绑定在 `0.0.0.0:0` 上的 UDP socket（即出口 NAT 端口），
+///    而系统动态端口范围有限（Windows 默认约 1.6 万个）；
+/// 2) 收包任务会预先预留约 128KB 的收包缓冲。
+///
+/// 只靠空闲超时回收的话，在高 churn 场景（DNS/QUIC 等源端口变化很快）下
+/// 表项和 socket 仍可能持续堆积到耗尽端口，导致 bind 失败、转发丢包，
+/// 因此这里再加一道数量上限保护。触发上限时按最后活跃时间淘汰最旧的表项，
+/// 正常场景不会触发，需要按部署规模调整该值时请同时考虑端口和内存开销。
+const NAT_MAX_ENTRIES: usize = 4096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct UdpNatKey {
     src_socket: SocketAddr,
@@ -167,7 +190,7 @@ impl UdpNatEntry {
                 }
 
                 let (len, src_socket) = match timeout(
-                    Duration::from_secs(120),
+                    NAT_RECV_POLL_INTERVAL,
                     self_clone
                         .socket
                         .as_ref()
@@ -181,9 +204,15 @@ impl UdpNatEntry {
                         tracing::error!(?err, "udp nat recv failed");
                         break;
                     }
-                    Err(err) => {
-                        tracing::error!(?err, "udp nat recv timeout");
-                        break;
+                    Err(_) => {
+                        // 本轮轮询没有收到响应，只是空闲，不能因此结束收发任务：
+                        // 表项何时回收由 is_active()/stop() 统一决定。若在这里退出，
+                        // 只发不收的单向流量（例如遥测、Syslog）会让表项变成僵尸表项，
+                        // 之后即使对端响应也收不到，且 socket 一直被占用。
+                        // 超时可能没有读到任何数据，清掉预分配的缓冲区（含 28 字节
+                        // 保留头），下一轮重新预留。
+                        cur_buf.clear();
+                        continue;
                     }
                 };
 
@@ -239,7 +268,7 @@ impl UdpNatEntry {
     }
 
     fn is_active(&self) -> bool {
-        self.last_active_time.load().elapsed().as_secs() < 180
+        self.last_active_time.load().elapsed().as_secs() < NAT_IDLE_TIMEOUT_SECS
     }
 }
 
@@ -436,8 +465,15 @@ impl UdpProxy {
             loop {
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 nat_table.retain(|_, v| {
-                    if !v.is_active() {
-                        tracing::info!(?v, "udp nat table entry removed");
+                    // 表项需要回收的两种情况：
+                    // 1) 空闲超时：NAT_IDLE_TIMEOUT_SECS 内没有任何收发流量；
+                    // 2) 收发任务已退出（stopped，例如 socket 收发报错）：此时请求
+                    //    可能还在转发，但响应已经收不到了，属于僵尸表项，继续保留
+                    //    只会白占一个 socket 和一个 NAT 端口，必须及时移除。
+                    let idle = !v.is_active();
+                    let dead = v.stopped.load(std::sync::atomic::Ordering::Relaxed);
+                    if idle || dead {
+                        tracing::info!(?v, idle, dead, "udp nat table entry removed");
                         v.stop();
                         false
                     } else {
@@ -445,6 +481,33 @@ impl UdpProxy {
                     }
                 });
                 nat_table.shrink_to_fit();
+
+                // 表项数量上限保护：每个表项都对应一个 0.0.0.0:0 的 UDP socket，
+                // 超过上限时按最后活跃时间淘汰最旧的表项。正常场景不会触发
+                // （空闲超时已经把数量控制住了），触发即说明出口流量或源端口
+                // churn 很高，需要告警。
+                let len = nat_table.len();
+                tracing::debug!(len, "udp nat table cleaned");
+                if len > NAT_MAX_ENTRIES {
+                    tracing::warn!(
+                        len,
+                        max = NAT_MAX_ENTRIES,
+                        "udp nat table entry count exceeds limit, evicting oldest entries"
+                    );
+                    let mut entries: Vec<(UdpNatKey, std::time::Instant)> = nat_table
+                        .iter()
+                        .map(|v| (*v.key(), v.last_active_time.load()))
+                        .collect();
+                    entries.sort_by_key(|(_, last_active)| *last_active);
+                    // 多淘汰 20%，避免随后的每轮清理都刚好卡在上限上反复淘汰。
+                    let to_remove = len - NAT_MAX_ENTRIES + NAT_MAX_ENTRIES / 5;
+                    for (key, _) in entries.into_iter().take(to_remove) {
+                        if let Some((_, v)) = nat_table.remove(&key) {
+                            tracing::info!(?key, "udp nat table entry evicted by size limit");
+                            v.stop();
+                        }
+                    }
+                }
             }
         });
 

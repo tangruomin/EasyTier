@@ -1,6 +1,6 @@
 use std::{
     fmt::{Debug, Formatter},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
@@ -16,7 +16,7 @@ use super::{
 };
 use crate::tunnel::common::{BindDev, bind};
 use crate::{
-    common::shrink_dashmap,
+    common::{global_ctx::ArcGlobalCtx, shrink_dashmap},
     tunnel::{
         build_url_from_socket_addr,
         common::TunnelWrapper,
@@ -38,6 +38,61 @@ use rand::RngCore;
 use tokio::{net::UdpSocket, sync::Mutex, task::JoinSet};
 
 const MAX_PACKET: usize = 2048;
+
+/// 补充项 4.4：wg connector 复用外层隧道的代码层防回环（第二道保险）。
+///
+/// 当 wg connector 的目标是 peer 的**物理地址**（公网/直连地址）时，是否禁用
+/// 「显式绑定接口地址」的 connect fan-out（只允许直连，不回退到外层隧道）。
+///
+/// 默认 `true` = 新行为：物理目标只做直连，绝不把 socket 钉在可能属于虚拟网络的接口
+/// 地址上。`bind_device` 默认为 `true`，`create_connector_by_url` 会把本机所有接口
+/// 地址（Windows 上含 EasyTier TUN 的虚拟网地址）都塞进 `bind_addrs`；一旦 wg
+/// connector 绑定到该虚拟网地址，socket 会被绑定到 TUN 设备（Windows 为
+/// `IP_UNICAST_IF`，Linux 为 `SO_BINDTODEVICE`），wg 握手包直接进入外层隧道，
+/// 经出口节点代理 NAT 改写源地址后回环到出口自身的 wg listener，形成回环风暴。
+///
+/// 需要灰度回滚本项时，把本常量改为 `false` 即可，无需改动其它文件。
+const WG_DIRECT_ONLY_FOR_PHYSICAL_DST: bool = true;
+
+/// 保守判断一个 IPv4 地址是否「一定是物理（公网）地址」。
+///
+/// 只有在拿不到 `GlobalCtx` 时才会用到本兜底判定（参见
+/// `WgTunnelConnector::dst_is_in_virtual_network`）：公网单播地址不可能是本虚拟
+/// 网络的地址，因此可以安全地按物理地址处理；私网 / 环回 / 链路本地 / 共享地址
+/// （100.64.0.0/10，覆盖 Magic DNS 假 IP 100.100.100.101）等一律按「可能是虚拟网
+/// 地址」处理，保持原有行为（允许复用外层隧道）。
+fn is_definitely_physical_addr_v4(v4: &Ipv4Addr) -> bool {
+    let o = v4.octets();
+    !(v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+        || v4.is_unspecified()
+        || v4.is_multicast()
+        // 100.64.0.0/10 共享地址（CGNAT），Magic DNS 假 IP 100.100.100.101 落在此段内
+        || (o[0] == 100 && (o[1] & 0xc0) == 64))
+}
+
+/// 保守判断目标地址是否「一定是物理（公网）地址」，见 `is_definitely_physical_addr_v4`。
+fn is_definitely_physical_addr(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_definitely_physical_addr_v4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_definitely_physical_addr_v4(&v4);
+            }
+            let seg = v6.segments();
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // fe80::/10 链路本地
+                || (seg[0] & 0xffc0) == 0xfe80
+                // fc00::/7 唯一本地地址
+                || (v6.octets()[0] & 0xfe) == 0xfc)
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 enum WgType {
@@ -599,6 +654,14 @@ pub struct WgTunnelConnector {
     bind_addrs: Vec<SocketAddr>,
     ip_version: IpVersion,
     resolved_addr: Option<SocketAddr>,
+
+    /// 用于「物理地址直连优先、禁用外层隧道复用」的防回环判定（补充项 4.4）。
+    ///
+    /// 可选：`WgTunnelConnector::new` 构造时为 `None`（保持既有调用点行为不变），
+    /// 此时退化为 `is_definitely_physical_addr` 的保守兜底判定。推荐调用方
+    /// （`connector::create_connector_by_url`）用 `new_with_global_ctx` 或
+    /// `set_global_ctx` 注入，以便精确识别本虚拟网络的地址。
+    global_ctx: Option<ArcGlobalCtx>,
 }
 
 impl Debug for WgTunnelConnector {
@@ -612,6 +675,17 @@ impl Debug for WgTunnelConnector {
 
 impl WgTunnelConnector {
     pub fn new(addr: url::Url, config: WgConfig) -> Self {
+        Self::new_with_global_ctx(addr, config, None)
+    }
+
+    /// 带 `GlobalCtx` 的构造：用于「物理地址直连优先、禁用外层隧道复用」的防回环判定
+    /// （补充项 4.4）。`connector::create_connector_by_url` 已有 `global_ctx`，推荐使用
+    /// 本构造函数。
+    pub fn new_with_global_ctx(
+        addr: url::Url,
+        config: WgConfig,
+        global_ctx: Option<ArcGlobalCtx>,
+    ) -> Self {
         WgTunnelConnector {
             addr,
             config,
@@ -619,6 +693,37 @@ impl WgTunnelConnector {
             bind_addrs: vec![],
             ip_version: IpVersion::Both,
             resolved_addr: None,
+            global_ctx,
+        }
+    }
+
+    /// 延迟注入 `GlobalCtx`，便于在不改构造函数签名的调用点启用防回环判定
+    /// （补充项 4.4）：`let mut c = WgTunnelConnector::new(url, cfg); c.set_global_ctx(global_ctx);`
+    pub fn set_global_ctx(&mut self, global_ctx: ArcGlobalCtx) {
+        self.global_ctx = Some(global_ctx);
+    }
+
+    /// 目标地址是否位于本虚拟网络内（此时允许复用外层隧道，保持原有行为）。
+    ///
+    /// 优先复用 `GlobalCtx::is_ip_in_same_network`（不自行解析配置字符串）；拿不到
+    /// `GlobalCtx` 时退化为保守兜底判定：只有公网地址才判定为「物理地址」。
+    fn dst_is_in_virtual_network(&self, ip: &IpAddr) -> bool {
+        match &self.global_ctx {
+            Some(global_ctx) => global_ctx.is_ip_in_same_network(ip),
+            None => !is_definitely_physical_addr(ip),
+        }
+    }
+
+    /// 判断某个绑定地址是否可用于「只允许直连」的物理目标。
+    ///
+    /// 本虚拟网络的地址（TUN 接口地址）会把 socket 钉在 TUN 设备上，使 wg 包经外层
+    /// 隧道回环，因此必须排除。拿不到 `GlobalCtx` 时无法区分虚拟网接口与物理接口，
+    /// 保守返回 `false`（调用方会退化为绑定 `0.0.0.0:0`，交给内核路由表选源，而不是
+    /// 主动把包送进外层隧道）。
+    fn can_bind_for_physical_dst(&self, bind_addr: &SocketAddr) -> bool {
+        match &self.global_ctx {
+            Some(global_ctx) => !global_ctx.is_ip_local_virtual_ip(&bind_addr.ip()),
+            None => false,
         }
     }
 
@@ -709,15 +814,66 @@ impl super::TunnelConnector for WgTunnelConnector {
             None => SocketAddr::from_url(self.addr.clone(), self.ip_version).await?,
         };
 
+        // 补充项 4.4：直连优先的代码层防回环（第二道保险）。
+        //
+        // 目标是本虚拟网络之外的物理地址（公网/直连地址）时，只允许直连，不允许把
+        // wg 包交给外层隧道；目标是虚拟网络内的地址时才保留原有行为（允许复用外层
+        // 隧道）。直连失败时本函数只返回失败，不做任何「退化为外层隧道」的兜底，
+        // 由上层（ManualConnectorManager / PeerManager）按既有失败处理与重试。
+        let direct_only =
+            WG_DIRECT_ONLY_FOR_PHYSICAL_DST && !self.dst_is_in_virtual_network(&addr.ip());
+        if direct_only {
+            tracing::info!(
+                ?addr,
+                has_global_ctx = self.global_ctx.is_some(),
+                "wg connector: 目标为本虚拟网络之外的物理地址，只允许直连，禁用外层隧道复用（防回环）"
+            );
+        } else {
+            tracing::debug!(
+                ?addr,
+                "wg connector: 目标可能位于本虚拟网络内，允许复用外层隧道"
+            );
+        }
+
         if addr.is_ipv6() {
             return self.connect_with_ipv6(addr).await;
         }
 
-        let bind_addrs = if self.bind_addrs.is_empty() {
+        let mut bind_addrs = if self.bind_addrs.is_empty() {
             vec!["0.0.0.0:0".parse().unwrap()]
         } else {
             self.bind_addrs.clone()
         };
+
+        if direct_only && !self.bind_addrs.is_empty() {
+            let (physical, rejected): (Vec<SocketAddr>, Vec<SocketAddr>) = bind_addrs
+                .iter()
+                .copied()
+                .partition(|bind_addr| self.can_bind_for_physical_dst(bind_addr));
+
+            if physical.is_empty() {
+                // 所有显式绑定地址都被判定为虚拟网地址（或无法判定）：退化为不显式
+                // 绑定，交给内核按路由表选源，而不是继续把 socket 钉在虚拟网接口上
+                // ——那正是回环的成因。
+                tracing::warn!(
+                    ?addr,
+                    rejected = ?rejected,
+                    has_global_ctx = self.global_ctx.is_some(),
+                    "wg connector: 物理目标下没有可用的物理绑定地址，退化为绑定 0.0.0.0:0（不再绑定虚拟网接口，防回环）"
+                );
+                bind_addrs = vec!["0.0.0.0:0".parse().unwrap()];
+            } else {
+                if !rejected.is_empty() {
+                    tracing::debug!(
+                        ?addr,
+                        rejected = ?rejected,
+                        "wg connector: 物理目标下跳过虚拟网接口绑定地址（防回环）"
+                    );
+                }
+                bind_addrs = physical;
+            }
+        }
+
         let futures = FuturesUnordered::new();
         for bind_addr in bind_addrs.into_iter() {
             tracing::info!(?bind_addr, ?addr, "bind addr");
@@ -788,6 +944,59 @@ pub mod tests {
         };
 
         (server_cfg, client_cfg)
+    }
+
+    /// 补充项 4.4：地址分类的保守兜底判定（无需网络，纯逻辑）。
+    #[test]
+    fn physical_addr_classification() {
+        let physical: Vec<IpAddr> = ["8.8.8.8", "35.74.75.198", "1.1.1.1", "2001:4860:4860::8888"]
+            .iter()
+            .map(|ip| ip.parse().unwrap())
+            .collect();
+        for ip in physical {
+            assert!(is_definitely_physical_addr(&ip), "{} 应判定为物理地址", ip);
+        }
+
+        let not_physical: Vec<IpAddr> = [
+            "10.126.126.1",    // EasyTier 默认虚拟网段
+            "100.100.100.101", // Magic DNS 假 IP，落在 100.64.0.0/10 共享地址段
+            "192.168.1.1",
+            "172.16.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+        ]
+        .iter()
+        .map(|ip| ip.parse().unwrap())
+        .collect();
+        for ip in not_physical {
+            assert!(
+                !is_definitely_physical_addr(&ip),
+                "{} 不应判定为物理地址",
+                ip
+            );
+        }
+    }
+
+    /// 补充项 4.4：无 `GlobalCtx` 时，物理目标必须禁用「显式绑定接口地址」。
+    #[test]
+    fn physical_dst_disables_iface_bind_without_global_ctx() {
+        let connector = WgTunnelConnector::new(
+            "wg://35.74.75.198:11011".parse().unwrap(),
+            create_wg_config().0,
+        );
+        assert!(
+            !connector.dst_is_in_virtual_network(&"35.74.75.198".parse().unwrap()),
+            "公网物理地址不应判定为虚拟网内地址"
+        );
+        assert!(
+            connector.dst_is_in_virtual_network(&"10.126.126.1".parse().unwrap()),
+            "虚拟网地址应判定为虚拟网内地址"
+        );
+        // 拿不到 GlobalCtx 时无法区分虚拟网接口与物理接口 → 保守拒绝显式绑定
+        assert!(!connector.can_bind_for_physical_dst(&"192.168.1.5:0".parse().unwrap()));
     }
 
     #[tokio::test]

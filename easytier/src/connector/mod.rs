@@ -258,7 +258,10 @@ pub async fn create_connector_by_url(
                         &nid.network_name,
                         &nid.network_secret.unwrap_or_default(),
                     );
-                    WgTunnelConnector::new(url, wg_config).boxed()
+                    // 注入 global_ctx：wg connector 需要据此区分"目标是物理地址"还是
+                    // "目标是虚拟网地址"，前者只允许直连、不允许复用外层隧道（防回环）
+                    WgTunnelConnector::new_with_global_ctx(url, wg_config, Some(global_ctx.clone()))
+                        .boxed()
                 }
                 #[cfg(feature = "websocket")]
                 IpScheme::Ws | IpScheme::Wss => {
