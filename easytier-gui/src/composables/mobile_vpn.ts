@@ -10,7 +10,7 @@ interface vpnStatus {
   ipv4Addr: string | null | undefined
   ipv4Cidr: number | null | undefined
   routes: string[]
-  dns: string | null | undefined
+  dns: string[]
 }
 
 let dhcpPollingTimer: NodeJS.Timeout | null = null
@@ -21,11 +21,14 @@ const curVpnStatus: vpnStatus = {
   ipv4Addr: undefined,
   ipv4Cidr: undefined,
   routes: [],
-  dns: undefined,
+  dns: [],
 }
 
 /** 全局出口默认路由网段。 */
 const DEFAULT_ROUTE_CIDR = '0.0.0.0/0'
+
+/** 魔法 DNS 的隧道内假 IP：easytier 核心在本机该地址上提供 DNS 服务。 */
+const MAGIC_DNS_IP = '100.100.100.101'
 
 /**
  * 后端当前是否安装了全局出口默认路由（0.0.0.0/0）。
@@ -56,6 +59,84 @@ export function applyProxyCidrsChange(added?: string[], removed?: string[]) {
   }
 }
 
+/**
+ * 解析实例配置里的 DNS 模式（`--dns-mode`）。
+ *
+ * 空值 / 未知值按 `auto` 处理，与 Rust 侧 `DnsMode::from_config_str` 保持一致。
+ */
+function resolveDnsMode(node_config: NetworkTypes.NetworkConfig): 'auto' | 'custom' | 'exit-node' {
+  const mode = (node_config.dns_mode ?? '').trim().toLowerCase()
+  if (mode === 'custom' || mode === 'exit-node') {
+    return mode
+  }
+  return 'auto'
+}
+
+/** 去掉 DNS 服务器字符串中的端口（VpnService.addDnsServer 只接受地址本身）。 */
+function stripDnsPort(server: string): string {
+  const s = (server ?? '').trim()
+  if (!s) {
+    return ''
+  }
+  // 暂不支持把 IPv6 字面量下发给 VpnService（需要 [addr]:port 形式），直接跳过
+  if (s.startsWith('[')) {
+    return ''
+  }
+  const idx = s.indexOf(':')
+  return idx >= 0 ? s.slice(0, idx) : s
+}
+
+/** 配置里第一个（即出口故障转移顺序中的第一个）可用的出口节点虚拟 IPv4。 */
+function pickExitNodeIp(node_config: NetworkTypes.NetworkConfig): string | undefined {
+  if (!exitDefaultRouteActive) {
+    return undefined
+  }
+  for (const node of node_config.exit_nodes ?? []) {
+    const ip = stripDnsPort(node ?? '')
+    if (ip) {
+      return ip
+    }
+  }
+  return undefined
+}
+
+/**
+ * 按 `dns_mode` 计算需要下发给 VpnService 的 DNS 服务器列表。
+ *
+ * - `custom`：用户填写的 DNS；
+ * - `exit-node`：出口节点的虚拟 IP（查询经隧道由出口节点解析，最干净）；
+ * - `auto`：有在线出口节点时用出口虚拟 IP，否则回退到魔法 DNS 的假 IP / 系统默认。
+ *
+ * 注意：这里**不会**下发境外公共 DNS（8.8.8.8 等）——那类地址在国内会被污染/拦截，
+ * 反而会连浏览器的 DoH 引导解析一起打断（历史回归点）。
+ */
+function resolveVpnDnsServers(
+  node_config: NetworkTypes.NetworkConfig,
+  exitIp?: string,
+): string[] {
+  const mode = resolveDnsMode(node_config)
+
+  if (mode === 'custom') {
+    const custom = (node_config.dns_servers ?? [])
+      .map(stripDnsPort)
+      .filter(s => s.length > 0)
+    if (custom.length > 0) {
+      return Array.from(new Set(custom))
+    }
+    console.warn('dns_mode=custom 但未配置有效 DNS，回退到魔法 DNS / 系统 DNS')
+  }
+
+  if (mode === 'exit-node' && !exitIp) {
+    console.warn('dns_mode=exit-node 但没有在线出口节点，回退到魔法 DNS / 系统 DNS')
+  }
+
+  if ((mode === 'auto' || mode === 'exit-node') && exitIp) {
+    return [exitIp]
+  }
+
+  return node_config.enable_magic_dns ? [MAGIC_DNS_IP] : []
+}
+
 async function requestVpnPermission() {
   console.log('prepare vpn')
   const prepare_ret = await prepare_vpn()
@@ -76,7 +157,7 @@ function resetVpnConfigStatus() {
   curVpnStatus.ipv4Addr = undefined
   curVpnStatus.ipv4Cidr = undefined
   curVpnStatus.routes = []
-  curVpnStatus.dns = undefined
+  curVpnStatus.dns = []
   // 复位出口默认路由状态，避免切换/重启网络实例后沿用上一次的旧状态
   exitDefaultRouteActive = true
 }
@@ -102,7 +183,7 @@ function syncVpnStatusFromNative(status: Awaited<ReturnType<typeof get_vpn_statu
   }
 
   curVpnStatus.routes = [...(status?.routes ?? [])]
-  curVpnStatus.dns = status?.dns ?? undefined
+  curVpnStatus.dns = [...(status?.dns ?? [])]
 }
 
 async function waitVpnStatus(target_status: boolean, timeout_sec: number) {
@@ -130,7 +211,7 @@ async function doStopVpn(force = false) {
   resetVpnConfigStatus()
 }
 
-async function doStartVpn(ipv4Addr: string, cidr: number, routes: string[], dns?: string) {
+async function doStartVpn(ipv4Addr: string, cidr: number, routes: string[], dns: string[]) {
   if (curVpnStatus.running) {
     return
   }
@@ -197,7 +278,11 @@ async function registerVpnServiceListener() {
   )
 }
 
-function getRoutesForVpn(routes: Route[], node_config: NetworkTypes.NetworkConfig): string[] {
+function getRoutesForVpn(
+  routes: Route[],
+  node_config: NetworkTypes.NetworkConfig,
+  dnsServers: string[],
+): string[] {
   if (!routes) {
     return []
   }
@@ -225,6 +310,11 @@ function getRoutesForVpn(routes: Route[], node_config: NetworkTypes.NetworkConfi
 
   if (node_config.enable_magic_dns) {
     ret.push('100.100.100.101/32')
+  }
+
+  // DNS 服务器必须经隧道可达，否则 netd 的查询会从运营商网络直连出去（被污染/被拦截）
+  for (const server of dnsServers) {
+    ret.push(`${server}/32`)
   }
 
   // sort and dedup
@@ -283,14 +373,14 @@ export async function onNetworkInstanceChange(instanceId: string) {
     network_length = 24
   }
 
-  const routes = getRoutesForVpn(curNetworkInfo?.routes, config)
-
-  const dns = config.enable_magic_dns ? '100.100.100.101' : undefined
+  const exitIp = pickExitNodeIp(config)
+  const dns = resolveVpnDnsServers(config, exitIp)
+  const routes = getRoutesForVpn(curNetworkInfo?.routes, config, dns)
 
   const ipChanged = virtual_ip !== curVpnStatus.ipv4Addr
   const cidrChanged = network_length !== curVpnStatus.ipv4Cidr
   const routesChanged = JSON.stringify(routes) !== JSON.stringify(curVpnStatus.routes)
-  const dnsChanged = dns != curVpnStatus.dns
+  const dnsChanged = JSON.stringify(dns) !== JSON.stringify(curVpnStatus.dns)
   const configChanged = ipChanged || cidrChanged || routesChanged || dnsChanged
   const shouldStartVpn = !curVpnStatus.running
 

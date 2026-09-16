@@ -644,6 +644,10 @@ pub struct Instance {
 
     proxy_cidrs_monitor: Option<AbortOnDropHandle<()>>,
 
+    /// 出口节点为本网络客户端提供的隧道内 DNS 服务（虚拟 IP:53）。
+    #[cfg(feature = "magic-dns")]
+    exit_dns_server: Option<AbortOnDropHandle<()>>,
+
     global_ctx: ArcGlobalCtx,
 }
 
@@ -730,6 +734,9 @@ impl Instance {
             socks5_server,
 
             proxy_cidrs_monitor: None,
+
+            #[cfg(feature = "magic-dns")]
+            exit_dns_server: None,
 
             global_ctx,
         }
@@ -1048,6 +1055,23 @@ impl Instance {
             self.check_dhcp_ip_conflict();
         }
 
+        // 全局路由（routes 含 0.0.0.0/0）场景：为所有 peer 的物理地址安装临时排除路由，
+        // 防止到 peer 的物理流量被 TUN 默认路由吸进隧道（wg 隧道源地址变成 TUN 虚拟 IP
+        // → 经外层隧道回到出口自身 → 回环）。详见《easytier-代码修复需求汇总版》修复点 2。
+        #[cfg(feature = "tun")]
+        {
+            let installed =
+                super::peer_route_exclude::install_peer_exclude_routes(&self.global_ctx).await;
+            if let Ok(installed) = installed
+                && installed > 0
+            {
+                tracing::info!(
+                    installed,
+                    "installed peer exclude routes to keep peer traffic on the physical interface"
+                );
+            }
+        }
+
         #[cfg(feature = "kcp")]
         if self.global_ctx.get_flags().enable_kcp_proxy {
             let src_proxy = KcpProxySrc::new(self.get_peer_manager()).await;
@@ -1096,21 +1120,60 @@ impl Instance {
 
         self.add_initial_peers().await?;
 
-        // 出口节点需要为客户端提供魔法 DNS 上游解析：客户端把非虚拟网域名的查询经隧道
-        // 交给出口节点，由出口节点用自身（通常在海外的、干净的）系统 DNS 解析后回传，
-        // 避免客户端本机上游 DNS 被污染 / 被劫持而解析到假 IP。
+        // 出口节点在隧道内虚拟 IP:53 上为客户端提供 DNS 服务（`--disable-exit-dns` 可关闭）：
+        // 客户端把 DNS 指向该地址后，域名查询经隧道交给出口节点、由出口节点用它自己
+        // （通常在海外的、干净的）系统 DNS 解析，避免客户端本机上游 DNS 被污染 / 被劫持。
+        // 这里不修改出口节点本机的系统 DNS 设置（那是 --accept-dns 的作用，仅适合客户端）。
         #[cfg(feature = "magic-dns")]
-        if self.global_ctx.enable_exit_node() {
-            self.peer_manager
-                .get_peer_rpc_mgr()
-                .rpc_server()
-                .registry()
-                .register(
-                    crate::proto::peer_rpc::MagicDnsForwardRpcServer::new(
-                        super::dns_server::forward_rpc::MagicDnsForwardService,
-                    ),
-                    &self.global_ctx.get_network_name(),
-                );
+        if self.global_ctx.enable_exit_node() && self.global_ctx.exit_dns_enabled() {
+            let peer_mgr = self.peer_manager.clone();
+            self.exit_dns_server = Some(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+                async move {
+                    // DHCP 场景下启动瞬间可能还没有虚拟 IP，轮询等待（最多 60s）
+                    let mut server = None;
+                    for i in 0..60 {
+                        if let Some(ipv4) = peer_mgr.get_global_ctx().get_ipv4() {
+                            match super::dns_server::exit_dns_server::ExitDnsServer::start(
+                                peer_mgr.clone(),
+                                ipv4.address(),
+                            )
+                            .await
+                            {
+                                Ok(s) => {
+                                    server = Some(s);
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("start exit node dns service failed: {:?}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        if i == 0 {
+                            tracing::info!(
+                                "waiting for virtual ipv4 before starting exit node dns service"
+                            );
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+
+                    match server {
+                        Some(server) => {
+                            tracing::info!(
+                                addr = %server.listen_addr(),
+                                "exit node dns service is serving clients"
+                            );
+                            // 持有服务直到实例停止（任务被 abort）
+                            std::future::pending::<()>().await;
+                        }
+                        None => {
+                            tracing::warn!(
+                                "exit node dns service not started: virtual ipv4 is unavailable"
+                            );
+                        }
+                    }
+                },
+            )));
         }
 
         let monitor = super::proxy_cidrs_monitor::ProxyCidrsMonitor::new(
@@ -1613,6 +1676,12 @@ impl Instance {
         self.peer_manager.clear_resources().await;
         #[cfg(feature = "tun")]
         let _ = self.nic_ctx.lock().await.take();
+
+        // 清理本实例安装的 peer 排除路由（Windows 的 route add 不带 -p 时仍会残留到重启）
+        #[cfg(feature = "tun")]
+        {
+            let _ = super::peer_route_exclude::remove_peer_exclude_routes().await;
+        }
     }
 }
 

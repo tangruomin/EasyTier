@@ -22,7 +22,7 @@ class PingArgs {
 class StartVpnArgs {
     var ipv4Addr: String? = null
     var routes: Array<String> = emptyArray()
-    var dns: String? = null
+    var dns: Array<String> = emptyArray()
     var disallowedApplications: Array<String> = emptyArray()
     var mtu: Int? = null
 }

@@ -22,20 +22,15 @@ use tokio::task::JoinSet;
 
 use super::config::{GeneralConfig, Record, RunConfig};
 
-/// 读不到系统 DNS 配置时使用的默认上游。
+/// 读不到系统 DNS 配置、且调用方没有指定兜底上游时使用的默认上游。
 ///
-/// 刻意**不使用** `crate::common::dns::get_default_resolver_config()`
-/// （其值为 `223.5.5.5` / `180.184.1.1` 等国内 DNS）：在「出口节点在海外」的魔法 DNS
-/// 场景下，国内 DNS 会对被墙域名返回污染结果，正是本问题要避免的。
+/// 这里刻意保持 2.6.4 的既有行为（`223.5.5.5` / `180.184.1.1`）：
+/// 本函数同时服务「客户端魔法 DNS」与「出口节点自建 DNS」两种场景，而客户端在中国大陆
+/// 网络下必须使用可用的本地 DNS，否则连 DoH 的引导解析都会失败（见
+/// `easytier-安卓回归与DNS链路分析.md`）。出口节点需要「干净上游」时由调用方通过
+/// `RunConfig::fallback_forward_upstreams` 显式指定。
 fn default_forward_resolver_config() -> ResolverConfig {
-    let mut config = ResolverConfig::new();
-    for server in ["8.8.8.8:53", "1.1.1.1:53"] {
-        config.add_name_server(NameServerConfig::new(
-            server.parse().unwrap(),
-            Protocol::Udp,
-        ));
-    }
-    config
+    crate::common::dns::get_default_resolver_config()
 }
 
 pub struct Server {
@@ -104,22 +99,61 @@ impl Server {
         }
 
         // use forwarder authority for the root zone
-        let system_conf = read_system_conf()
-            .unwrap_or((default_forward_resolver_config(), ResolverOpts::default()));
+        //
+        // 上游选择顺序：
+        // 1. 调用方显式指定（`dns_mode = custom`，或出口节点自建 DNS 指定上游）；
+        // 2. 本机系统 DNS 配置（桌面平台正常路径，与 2.6.4 一致）；
+        // 3. 读不到系统配置时：调用方指定的兜底上游；再没有才用 2.6.4 的默认国内 DNS。
+        //
+        // 注意：**客户端绝不使用写死的境外 DNS 作兜底**（历史回归点，详见
+        // `easytier-安卓回归与DNS链路分析.md`）：Android 上 `read_system_conf()` 必然失败，
+        // 一旦兜底成 8.8.8.8，浏览器 DoH 的引导解析都会失败，反而比 2.6.4 更差。
+        let (mut name_servers, options) = if !config.forward_upstreams().is_empty() {
+            (
+                config
+                    .forward_upstreams()
+                    .iter()
+                    .map(|addr| NameServerConfig::new(*addr, Protocol::Udp))
+                    .collect::<Vec<_>>(),
+                ResolverOpts::default(),
+            )
+        } else {
+            match read_system_conf() {
+                Ok((conf, opts)) => (conf.name_servers().to_vec(), opts),
+                Err(e) => {
+                    let fallback = if config.fallback_forward_upstreams().is_empty() {
+                        crate::common::log::warn!(
+                            "read system dns config failed ({}), use default local dns as upstream",
+                            e
+                        );
+                        default_forward_resolver_config().name_servers().to_vec()
+                    } else {
+                        crate::common::log::warn!(
+                            "read system dns config failed ({}), use configured fallback upstream {:?}",
+                            e,
+                            config.fallback_forward_upstreams()
+                        );
+                        config
+                            .fallback_forward_upstreams()
+                            .iter()
+                            .map(|addr| NameServerConfig::new(*addr, Protocol::Udp))
+                            .collect()
+                    };
+                    (fallback, ResolverOpts::default())
+                }
+            }
+        };
+
+        // 排除 easytier 自身地址（例如魔法 DNS 的假 IP、本节点虚拟 IP），防止解析成环
+        name_servers.retain(|x| {
+            !config
+                .excluded_forward_nameservers()
+                .contains(&x.socket_addr.ip())
+        });
+
         let forward_config = ForwardConfig {
-            name_servers: system_conf
-                .0
-                .name_servers()
-                .iter()
-                .filter(|&x| {
-                    !config
-                        .excluded_forward_nameservers()
-                        .contains(&x.socket_addr.ip())
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-                .into(),
-            options: Some(system_conf.1),
+            name_servers: name_servers.into(),
+            options: Some(options),
         };
         let auth = ForwardAuthority::builder_with_config(
             forward_config,

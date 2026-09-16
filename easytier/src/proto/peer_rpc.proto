@@ -307,25 +307,6 @@ service PeerCenterRpc {
       returns (GetGlobalPeerMapResponse);
 }
 
-message ResolveDnsRequest {
-  // 原始 DNS 查询报文（wire format），由客户端魔法 DNS 原样透传
-  bytes query = 1;
-}
-
-message ResolveDnsResponse {
-  // 原始 DNS 应答报文（wire format）
-  bytes response = 1;
-  // 解析失败原因；成功时为空字符串
-  string error = 2;
-}
-
-// 魔法 DNS 上游转发：客户端把非虚拟网域名（非 .et.net.）的查询经隧道交给出口节点，
-// 由出口节点用其自身的（通常在海外的、干净的）系统 DNS 解析后回传。
-// 这样可以避免客户端本机上游 DNS 被污染 / 被劫持导致域名解析到假 IP。
-service MagicDnsForwardRpc {
-  rpc ResolveDns(ResolveDnsRequest) returns (ResolveDnsResponse);
-}
-
 message HandshakeRequest {
   uint32 magic = 1;
   uint32 my_peer_id = 2;

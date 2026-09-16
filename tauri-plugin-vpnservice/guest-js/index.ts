@@ -16,7 +16,12 @@ export interface InvokeResponse {
 export interface StartVpnRequest {
   ipv4Addr?: string;
   routes?: string[];
-  dns?: string;
+  /**
+   * 下发给 VpnService 的 DNS 服务器列表。由前端按实例配置的 dns_mode 决定：
+   * auto（有在线出口 -> 出口虚拟 IP；否则 100.100.100.101）/ custom（用户填写）
+   * / exit-node（出口虚拟 IP）。
+   */
+  dns?: string[];
   disallowedApplications?: string[];
   mtu?: number;
 }
@@ -25,7 +30,7 @@ export interface VpnStatusResponse {
   running: boolean;
   ipv4Addr?: string;
   routes?: string[];
-  dns?: string;
+  dns?: string[];
 }
 
 export async function prepare_vpn(): Promise<InvokeResponse | null> {

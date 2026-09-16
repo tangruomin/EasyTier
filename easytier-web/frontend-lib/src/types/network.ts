@@ -155,8 +155,67 @@ export interface NetworkConfig {
   enable_magic_dns?: boolean
   enable_private_mode?: boolean
 
+  // DNS 上游模式：'auto'（默认，等价于未设置或空字符串）/ 'custom' / 'exit-node'。
+  // 它只决定「域名查询交给谁解析」，与 enable_magic_dns（魔法 DNS）可组合使用。
+  // DNS upstream mode: 'auto' (default, same as unset or empty string) / 'custom' / 'exit-node'.
+  // It only decides who resolves domain queries and can be combined with enable_magic_dns.
+  dns_mode?: string
+  // dns_mode = 'custom' 时使用的 DNS 服务器列表，可省略端口（默认 53）。
+  // DNS servers used when dns_mode = 'custom'; the port may be omitted (defaults to 53).
+  dns_servers?: string[]
+  // 出口节点是否禁止提供隧道内 DNS 服务。默认 false = 出口节点在虚拟 IP:53 提供 DNS 服务。
+  // Whether the exit node disables the in-tunnel DNS service. Default false = the exit node
+  // serves DNS on virtual IP:53.
+  disable_exit_dns?: boolean
+
   port_forwards: PortForwardConfig[]
   acl?: Acl
+}
+
+/** DNS 上游模式取值，需与后端 `DnsMode`（`--dns-mode`）保持一致。 */
+// DNS upstream mode values; must stay in sync with the backend `DnsMode` (`--dns-mode`).
+export const DNS_MODE_AUTO = 'auto'
+export const DNS_MODE_CUSTOM = 'custom'
+export const DNS_MODE_EXIT_NODE = 'exit-node'
+
+export type DnsMode = typeof DNS_MODE_AUTO | typeof DNS_MODE_CUSTOM | typeof DNS_MODE_EXIT_NODE
+
+/**
+ * 读取 dns_mode：undefined / 空字符串 / 无法识别的取值都按 'auto' 处理（与后端一致）。
+ * Read dns_mode: undefined, empty string and unknown values all fall back to 'auto'
+ * (same behaviour as the backend).
+ */
+export function getDnsMode(config: NetworkConfig | undefined): DnsMode {
+  const mode = (config?.dns_mode ?? '').trim().toLowerCase()
+  switch (mode) {
+    case DNS_MODE_CUSTOM:
+      return DNS_MODE_CUSTOM
+    case DNS_MODE_EXIT_NODE:
+    case 'exit_node':
+    case 'exitnode':
+      return DNS_MODE_EXIT_NODE
+    default:
+      return DNS_MODE_AUTO
+  }
+}
+
+/** 过滤 DNS 服务器列表中的空白项并 trim。 / Trim entries and drop blanks from a DNS server list. */
+export function cleanDnsServers(servers: string[] | undefined): string[] {
+  return (servers ?? []).map((server) => server.trim()).filter((server) => server.length > 0)
+}
+
+/**
+ * 解析用户输入的 DNS 服务器文本：按英文/中文逗号、分号或空白分隔，并过滤空项。
+ * Parse user-entered DNS server text: split on ASCII/CJK commas, semicolons or whitespace,
+ * then drop empty entries.
+ */
+export function parseDnsServersText(text: string | undefined): string[] {
+  return cleanDnsServers((text ?? '').split(/[,，;；\s]+/))
+}
+
+/** 将 DNS 服务器列表序列化为逗号分隔文本。 / Serialize a DNS server list as comma-separated text. */
+export function formatDnsServersText(servers: string[] | undefined): string {
+  return cleanDnsServers(servers).join(', ')
 }
 
 export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
@@ -226,6 +285,9 @@ export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
     mapped_listeners: [],
     enable_magic_dns: false,
     enable_private_mode: false,
+    dns_mode: DNS_MODE_AUTO,
+    dns_servers: [],
+    disable_exit_dns: false,
     port_forwards: [],
     acl: {
       acl_v1: {
@@ -265,6 +327,11 @@ export function normalizeNetworkConfig(config: NetworkConfig): NetworkConfig {
 
   normalized.networking_method = NetworkingMethod.Manual
   normalized.public_server_url = ''
+  // DNS 字段：写入规范化的显式取值，避免 undefined / 空字符串在后端落到不同分支。
+  // DNS fields: write normalised explicit values so that undefined / empty string can never
+  // hit different code paths on the backend.
+  normalized.dns_mode = getDnsMode(normalized)
+  normalized.dns_servers = cleanDnsServers(normalized.dns_servers)
   return normalized
 }
 

@@ -23,7 +23,8 @@ pub struct VoidRequest {}
 pub struct StartVpnRequest {
     pub ipv4_addr: Option<String>,
     pub routes: Option<Vec<String>>,
-    pub dns: Option<String>,
+    /// 下发给 VpnService 的 DNS 服务器列表（按 dns_mode 由前端决定）
+    pub dns: Option<Vec<String>>,
     pub disallowed_applications: Option<Vec<String>>,
     pub mtu: Option<u32>,
 }
@@ -40,5 +41,5 @@ pub struct VpnStatus {
     pub running: bool,
     pub ipv4_addr: Option<String>,
     pub routes: Option<Vec<String>>,
-    pub dns: Option<String>,
+    pub dns: Option<Vec<String>>,
 }

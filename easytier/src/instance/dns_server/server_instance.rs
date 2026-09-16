@@ -60,6 +60,54 @@ use std::{
 
 static NIC_PIPELINE_NAME: &str = "magic_dns_server";
 
+/// 根据路由表构造虚拟网主机名区域的 DNS 记录（`<hostname>.<zone>` -> 虚拟 IPv4 + SOA）。
+///
+/// 同时被「客户端魔法 DNS」（[`MagicDnsServerInstanceData`]）与「出口节点自带 DNS 服务」
+/// （[`super::exit_dns_server`]）复用，保证两处解析结果一致。
+pub(super) fn build_zone_records<'a>(
+    routes: impl Iterator<Item = &'a Route>,
+    zone: &str,
+) -> Result<Vec<Record>, anyhow::Error> {
+    let mut records: Vec<Record> = vec![];
+    for route in routes {
+        if route.hostname.is_empty() {
+            continue;
+        }
+
+        let Some(ipv4_addr) = route.ipv4_addr.unwrap_or_default().address else {
+            continue;
+        };
+
+        let record = RecordBuilder::default()
+            .rr_type(RecordType::A)
+            .name(format!("{}.{}", route.hostname, zone))
+            .value(ipv4_addr.to_string())
+            .ttl(Duration::from_secs(1))
+            .build()?;
+
+        // check record name valid for dns
+        if let Err(e) = record.name() {
+            tracing::error!("Invalid subdomain label: {}", e);
+            continue;
+        }
+
+        records.push(record);
+    }
+
+    let soa_record = RecordBuilder::default()
+        .rr_type(RecordType::SOA)
+        .name(zone.to_string())
+        .value(format!(
+            "ns.{} hostmaster.{} 2023101001 7200 3600 1209600 86400",
+            zone, zone
+        ))
+        .ttl(Duration::from_secs(60))
+        .build()?;
+    records.push(soa_record);
+
+    Ok(records)
+}
+
 pub(super) struct MagicDnsServerInstanceData {
     dns_server: Server,
     tun_dev: Option<String>,
@@ -86,42 +134,7 @@ impl MagicDnsServerInstanceData {
         routes: T,
         zone: &str,
     ) -> Result<(), anyhow::Error> {
-        let mut records: Vec<Record> = vec![];
-        for route in routes {
-            if route.hostname.is_empty() {
-                continue;
-            }
-
-            let Some(ipv4_addr) = route.ipv4_addr.unwrap_or_default().address else {
-                continue;
-            };
-
-            let record = RecordBuilder::default()
-                .rr_type(RecordType::A)
-                .name(format!("{}.{}", route.hostname, zone))
-                .value(ipv4_addr.to_string())
-                .ttl(Duration::from_secs(1))
-                .build()?;
-
-            // check record name valid for dns
-            if let Err(e) = record.name() {
-                tracing::error!("Invalid subdomain label: {}", e);
-                continue;
-            }
-
-            records.push(record);
-        }
-
-        let soa_record = RecordBuilder::default()
-            .rr_type(RecordType::SOA)
-            .name(zone.to_string())
-            .value(format!(
-                "ns.{} hostmaster.{} 2023101001 7200 3600 1209600 86400",
-                zone, zone
-            ))
-            .ttl(Duration::from_secs(60))
-            .build()?;
-        records.push(soa_record);
+        let records = build_zone_records(routes, zone)?;
 
         let authority = build_authority(zone, &records)?;
 
@@ -402,19 +415,27 @@ impl MagicDnsServerInstanceData {
         };
 
         let response_payload = {
-            // 非虚拟网域名（非 `.et.net.`）优先经隧道交给出口节点解析：
-            // 出口节点通常在海外、其系统 DNS 干净，可避免本机上游 DNS 被污染 / 被劫持而
-            // 解析到假 IP（Android 上尤为明显，因为 easytier 自身 socket 不经隧道）。
-            // 出口节点不可用或解析失败时，回退到本机上游转发（保持 2.6.4 行为）。
-            let exit_node_response = if Self::is_local_dns_zone_name(&request, &self.tld_dns_zone) {
-                None
-            } else {
-                match self.peer_mgr.upgrade() {
+            // 非虚拟网域名（非 `.et.net.`）的解析路径由 `dns_mode` 决定：
+            // - `custom`：只使用用户指定上游（`ForwardAuthority` 已按 custom 配置），不做出口转发；
+            // - `auto` / `exit-node`：优先经隧道交给出口节点自带的 DNS 服务（虚拟 IP:53）解析，
+            //   出口通常在海外、其系统 DNS 干净；出口不可用时**回退到本机上游**
+            //   （自定义上游或系统 DNS），绝不回落成写死的境外 DNS。
+            let peer_mgr = self.peer_mgr.upgrade();
+            let exit_dns_allowed = peer_mgr
+                .as_ref()
+                .map(|m| m.get_global_ctx().dns_mode() != crate::common::config::DnsMode::Custom)
+                .unwrap_or(false)
+                && !Self::is_local_dns_zone_name(&request, &self.tld_dns_zone);
+
+            let exit_node_response = if exit_dns_allowed {
+                match peer_mgr.as_ref() {
                     Some(peer_mgr) => {
-                        super::forward_rpc::resolve_dns_via_exit_node(&peer_mgr, &query_bytes).await
+                        super::exit_dns_relay::resolve_external_query(peer_mgr, &query_bytes).await
                     }
                     None => None,
                 }
+            } else {
+                None
             };
 
             match exit_node_response {
@@ -572,9 +593,28 @@ impl MagicDnsServerInstance {
         let mut rpc_server = StandAloneServer::new(tcp_listener);
         rpc_server.serve().await?;
 
+        // 客户端魔法 DNS 的上游：
+        // - `dns_mode = custom`：只使用用户指定的 DNS 服务器；
+        // - 其它模式：保持 2.6.4 行为 —— 优先本机系统 DNS，读不到时由 `server.rs` 兜底到
+        //   本机默认 DNS（223.5.5.5 / 180.184.1.1），**不使用境外 DNS 兜底**。
+        let global_ctx = peer_mgr.get_global_ctx();
+        let dns_mode = global_ctx.dns_mode();
+        let custom_upstreams = if dns_mode == crate::common::config::DnsMode::Custom {
+            let parsed = crate::common::config::parse_dns_servers(&global_ctx.dns_servers());
+            if parsed.is_empty() {
+                tracing::warn!(
+                    "dns_mode is custom but no valid dns server is configured, fall back to system dns"
+                );
+            }
+            parsed
+        } else {
+            Vec::new()
+        };
+
         let dns_config = RunConfigBuilder::default()
             .general(GeneralConfigBuilder::default().build()?)
             .excluded_forward_nameservers(vec![fake_ip.into()])
+            .forward_upstreams(custom_upstreams)
             .build()?;
         let mut dns_server = Server::new(dns_config);
         dns_server.run().await?;

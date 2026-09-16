@@ -16,7 +16,7 @@ class TauriVpnService : VpnService() {
         @JvmField var self: TauriVpnService? = null
         @JvmField var ipv4Addr: String? = null
         @JvmField var routes: Array<String> = emptyArray()
-        @JvmField var dns: String? = null
+        @JvmField var dns: Array<String> = emptyArray()
 
         const val IPV4_ADDR = "IPV4_ADDR"
         const val ROUTES = "ROUTES"
@@ -32,7 +32,7 @@ class TauriVpnService : VpnService() {
         var args = intent?.getExtras()
         ipv4Addr = args?.getString(IPV4_ADDR)
         routes = args?.getStringArray(ROUTES) ?: emptyArray()
-        dns = args?.getString(DNS)
+        dns = args?.getStringArray(DNS) ?: emptyArray()
 
         vpnInterface = createVpnInterface(args)
         println("vpn created ${vpnInterface.fd}")
@@ -75,7 +75,7 @@ class TauriVpnService : VpnService() {
     private fun clearStatus() {
         ipv4Addr = null
         routes = emptyArray()
-        dns = null
+        dns = emptyArray()
     }
 
     private fun createVpnInterface(args: Bundle?): ParcelFileDescriptor {
@@ -85,21 +85,29 @@ class TauriVpnService : VpnService() {
         
         var mtu = args?.getInt(MTU) ?: 1500
         var ipv4Addr = args?.getString(IPV4_ADDR) ?: "10.126.126.1/24"
-        var dns: String? = args?.getString(DNS)
+        var dns = args?.getStringArray(DNS) ?: emptyArray()
         var routes = args?.getStringArray(ROUTES) ?: emptyArray()
         var disallowedApplications = args?.getStringArray(DISALLOWED_APPLICATIONS) ?: emptyArray()
 
         println("vpn create vpn interface. mtu: $mtu, ipv4Addr: $ipv4Addr, dns:" +
-            "$dns, routes: ${java.util.Arrays.toString(routes)}," +
+            "${java.util.Arrays.toString(dns)}, routes: ${java.util.Arrays.toString(routes)}," +
             "disallowedApplications:  ${java.util.Arrays.toString(disallowedApplications)}")
 
         val ipParts = ipv4Addr.split("/")
         if (ipParts.size != 2) throw IllegalArgumentException("Invalid IP addr string")
         builder.addAddress(ipParts[0], ipParts[1].toInt())
-        builder.addAddress("fd00::1", 128)
+        // 注意：这里**不再**添加 IPv6 地址（fd00::1/128）。
+        // 本 VPN 的路由全部来自 easytier 的 IPv4 proxy_cidrs，没有任何 IPv6 路由；
+        // 一旦给 VPN 接口配上 IPv6 地址，Android 会把该接口视为支持 IPv6，应用拿到 AAAA
+        // 记录后会优先走 IPv6 从而形成连接黑洞（表现为"部分网站打不开/超时"）。
+        // 详见《easytier-代码修复需求汇总版》4.5。
 
         builder.setMtu(mtu)
-        dns?.let { builder.addDnsServer(it) }
+        for (server in dns) {
+            if (server.isNotEmpty()) {
+                builder.addDnsServer(server)
+            }
+        }
 
         for (route in routes) {
             val ipParts = route.split("/")

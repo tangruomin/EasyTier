@@ -177,6 +177,32 @@ enable_private_mode: 启用私有模式
 enable_private_mode_help: |
   启用私有模式，则不允许使用了与本网络不相同的网络名称和密码的节点通过本节点进行握手或中转。
 
+dns_settings: DNS 设置
+dns_mode: DNS 模式
+dns_mode_help: |
+  决定域名查询交给谁解析，与“魔法DNS（启用魔法DNS）”可组合使用：
+  魔法DNS 只负责把魔法 DNS 记录写进本机系统 DNS 设置，DNS 模式只决定由谁解析。
+dns_mode_auto: 默认
+dns_mode_auto_help: |
+  存在在线出口节点时，使用出口节点提供的 DNS 服务解析域名；否则保持系统 DNS 不变。
+dns_mode_custom: 自定义
+dns_mode_custom_help: |
+  使用下面填写的 DNS 服务器解析域名，忽略系统 DNS。
+dns_mode_exit_node: 使用出口节点 DNS
+dns_mode_exit_node_help: |
+  始终经隧道把域名查询交给出口节点的 DNS 服务（虚拟 IP:53）解析。
+  在被墙或被 DNS 污染的网络里推荐使用。
+dns_servers: DNS 服务器
+dns_servers_help: |
+  仅在 DNS 模式为“自定义”时生效。多个服务器用英文逗号分隔，可省略端口（默认 53）。
+  例如：223.5.5.5, 1.1.1.1:53
+dns_servers_placeholder: "例如：223.5.5.5, 1.1.1.1:53"
+provide_tunnel_dns: "为客户端提供隧道内 DNS 服务（虚拟 IP:53）"
+provide_tunnel_dns_help: |
+  仅对出口节点生效。勾选后，出口节点会在隧道内虚拟 IP 的 53 端口为客户端提供 DNS 服务（推荐）。
+  取消勾选等价于配置中的 disable_exit_dns = true。
+provide_tunnel_dns_only_exit_node: 仅当本节点启用为出口节点时生效（可在“高级设置 - 功能开关”中开启出口节点）。
+
 relay_network_whitelist: 网络白名单
 relay_network_whitelist_help: |
   仅转发白名单网络的流量，支持通配符字符串。多个网络名称间可以使用英文空格间隔。

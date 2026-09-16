@@ -5,11 +5,17 @@ import InputGroupAddon from 'primevue/inputgroupaddon'
 import {
   addRow,
   DEFAULT_NETWORK_CONFIG,
+  DNS_MODE_AUTO,
+  DNS_MODE_CUSTOM,
+  DNS_MODE_EXIT_NODE,
+  formatDnsServersText,
+  getDnsMode,
   NetworkConfig,
   normalizeNetworkConfig,
+  parseDnsServersText,
   removeRow
 } from '../types/network'
-import { ref, onMounted, onUnmounted, watch } from 'vue'
+import { computed, ref, onMounted, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import AclManager from './acl/AclManager.vue'
 import UrlListInput from './UrlListInput.vue'
@@ -151,6 +157,73 @@ onMounted(() => {
     });
   }
 });
+
+// ---------------------------------------------------------------------------
+// DNS：dns_mode / dns_servers / disable_exit_dns
+// 表单只在用户真正改动时才写回这些字段，因此其它字段的往返（round-trip）不受影响。
+// DNS: dns_mode / dns_servers / disable_exit_dns.
+// The form only writes these fields back once the user actually changes them, so the
+// round-trip of every other field stays untouched.
+// ---------------------------------------------------------------------------
+
+const dnsModeOptions = computed(() => [
+  { label: t('dns_mode_auto'), value: DNS_MODE_AUTO },
+  { label: t('dns_mode_custom'), value: DNS_MODE_CUSTOM },
+  { label: t('dns_mode_exit_node'), value: DNS_MODE_EXIT_NODE },
+])
+
+/** undefined / 空字符串都显示为“默认”（auto）。 / undefined / "" are shown as "Default" (auto). */
+const dnsMode = computed({
+  get: () => getDnsMode(curNetwork.value),
+  set: (value: string) => {
+    curNetwork.value.dns_mode = value
+  },
+})
+
+/** 逗号分隔文本 ⇄ dns_servers 数组，自动过滤空项。 */
+/** Comma-separated text ⇄ dns_servers array; empty entries are filtered out. */
+// 用一份“草稿文本”做双向绑定：如果直接把 dns_servers 数组渲染回输入框，
+// 每敲一个字符都会被重新格式化（例如刚输入的逗号会立刻消失），导致无法输入第二项。
+// A separate draft string keeps typing usable: rendering the parsed array straight back
+// into the input would re-format on every keystroke and swallow the comma being typed.
+const dnsServersDraft = ref('')
+
+const dnsServersText = computed({
+  get: () => dnsServersDraft.value,
+  set: (value: string) => {
+    dnsServersDraft.value = value
+    curNetwork.value.dns_servers = parseDnsServersText(value)
+  },
+})
+
+// 配置对象被外部替换（读取已有配置 / 导入 TOML / 切换实例）时重新同步输入框。
+// Re-sync the text box whenever the config object is replaced from the outside
+// (loading an existing config, importing TOML, switching instances).
+watch(() => curNetwork.value, (network) => {
+  dnsServersDraft.value = formatDnsServersText(network?.dns_servers)
+}, { immediate: true })
+
+/** 正向语义：勾选 = 出口节点提供隧道内 DNS 服务 = disable_exit_dns 取反。 */
+/** Positive semantics: checked = exit node serves in-tunnel DNS = disable_exit_dns negated. */
+const provideTunnelDns = computed({
+  get: () => !(curNetwork.value?.disable_exit_dns ?? false),
+  set: (value: boolean) => {
+    curNetwork.value.disable_exit_dns = !value
+  },
+})
+
+/** 当前模式的说明文案；用显式分支而不是拼接 i18n key，避免 key 写错。 */
+/** Help text of the selected mode; explicit branches instead of a computed i18n key. */
+const dnsModeHelp = computed(() => {
+  switch (dnsMode.value) {
+    case DNS_MODE_CUSTOM:
+      return t('dns_mode_custom_help')
+    case DNS_MODE_EXIT_NODE:
+      return t('dns_mode_exit_node_help')
+    default:
+      return t('dns_mode_auto_help')
+  }
+})
 
 function syncNormalizedNetwork(network: NetworkConfig | undefined): void {
   if (!network) {
@@ -400,6 +473,50 @@ watch(() => curNetwork.value, syncNormalizedNetwork, { immediate: true, deep: fa
                 </div>
               </div>
 
+            </div>
+          </Panel>
+
+          <Divider />
+
+          <Panel :header="t('dns_settings')" toggleable collapsed>
+            <div class="flex flex-col gap-y-2">
+              <div class="flex flex-row gap-x-9 flex-wrap">
+                <div class="flex flex-col gap-2 basis-5/12 grow">
+                  <div class="flex">
+                    <label for="dns_mode">{{ t('dns_mode') }}</label>
+                    <span class="pi pi-question-circle ml-2 self-center" v-tooltip="t('dns_mode_help')"></span>
+                  </div>
+                  <SelectButton id="dns_mode" v-model="dnsMode" :options="dnsModeOptions" option-label="label"
+                    option-value="value" :allow-empty="false" />
+                  <small class="p-text-secondary whitespace-pre-wrap">{{ dnsModeHelp }}</small>
+                </div>
+              </div>
+
+              <div v-if="dnsMode === DNS_MODE_CUSTOM" class="flex flex-row gap-x-9 flex-wrap">
+                <div class="flex flex-col gap-2 basis-5/12 grow">
+                  <div class="flex">
+                    <label for="dns_servers">{{ t('dns_servers') }}</label>
+                    <span class="pi pi-question-circle ml-2 self-center" v-tooltip="t('dns_servers_help')"></span>
+                  </div>
+                  <InputText id="dns_servers" v-model="dnsServersText" :placeholder="t('dns_servers_placeholder')"
+                    aria-describedby="dns_servers-help" />
+                </div>
+              </div>
+
+              <div class="flex flex-row gap-x-9 flex-wrap">
+                <div class="flex flex-col gap-2 basis-5/12 grow">
+                  <div class="flex items-center">
+                    <Checkbox v-model="provideTunnelDns" input-id="provide_tunnel_dns" :binary="true"
+                      :disabled="!curNetwork.enable_exit_node" />
+                    <label for="provide_tunnel_dns" class="ml-2"> {{ t('provide_tunnel_dns') }} </label>
+                    <span class="pi pi-question-circle ml-2 self-center"
+                      v-tooltip="t('provide_tunnel_dns_help')"></span>
+                  </div>
+                  <small v-if="!curNetwork.enable_exit_node" class="p-text-secondary">
+                    {{ t('provide_tunnel_dns_only_exit_node') }}
+                  </small>
+                </div>
+              </div>
             </div>
           </Panel>
 

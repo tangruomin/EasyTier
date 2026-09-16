@@ -2,7 +2,7 @@ use hickory_proto::rr;
 use hickory_proto::rr::RData;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -16,6 +16,22 @@ pub struct RunConfig {
     #[builder(default = Vec::new())]
     #[serde(default)]
     excluded_forward_nameservers: Vec<IpAddr>,
+
+    /// 显式指定的转发上游（`dns_mode = custom`，或出口节点自建 DNS 服务指定上游）。
+    ///
+    /// 非空时**只**使用这些上游，不再读取本机系统 DNS 配置。
+    #[builder(default = Vec::new())]
+    #[serde(default)]
+    forward_upstreams: Vec<SocketAddr>,
+
+    /// 读不到本机系统 DNS 配置时的兜底上游。
+    ///
+    /// 为空时沿用 2.6.4 的默认值（`223.5.5.5` / `180.184.1.1`，见
+    /// `crate::common::dns::get_default_resolver_config`）——**客户端必须保持该行为**，
+    /// 否则在中国大陆网络下会把域名解析交给被 GFW 干扰的境外 DNS。
+    #[builder(default = Vec::new())]
+    #[serde(default)]
+    fallback_forward_upstreams: Vec<SocketAddr>,
 }
 
 impl RunConfig {
@@ -29,6 +45,14 @@ impl RunConfig {
 
     pub fn excluded_forward_nameservers(&self) -> &Vec<IpAddr> {
         &self.excluded_forward_nameservers
+    }
+
+    pub fn forward_upstreams(&self) -> &Vec<SocketAddr> {
+        &self.forward_upstreams
+    }
+
+    pub fn fallback_forward_upstreams(&self) -> &Vec<SocketAddr> {
+        &self.fallback_forward_upstreams
     }
 }
 

@@ -176,6 +176,32 @@ enable_private_mode: Enable Private Mode
 enable_private_mode_help: |
   Enable private mode, nodes with different network names or passwords from this network are not allowed to perform handshake or relay through this node.
 
+dns_settings: DNS Settings
+dns_mode: DNS Mode
+dns_mode_help: |
+  Decides who resolves domain names for this node. It can be combined with "Magic DNS (Enable Magic DNS)":
+  Magic DNS only writes magic DNS records into the system DNS settings, while DNS Mode decides who resolves.
+dns_mode_auto: Default
+dns_mode_auto_help: |
+  Use the DNS service provided by an online exit node when one exists; otherwise keep the system DNS unchanged.
+dns_mode_custom: Custom
+dns_mode_custom_help: |
+  Resolve domain names with the DNS servers below and ignore the system DNS.
+dns_mode_exit_node: Use Exit Node DNS
+dns_mode_exit_node_help: |
+  Always send domain queries through the tunnel to the exit node's DNS service (virtual IP:53).
+  Recommended on censored networks or networks with DNS poisoning.
+dns_servers: DNS Servers
+dns_servers_help: |
+  Only used when DNS Mode is "Custom". Separate multiple servers with commas; the port may be omitted (default 53).
+  e.g.: 223.5.5.5, 1.1.1.1:53
+dns_servers_placeholder: "e.g.: 223.5.5.5, 1.1.1.1:53"
+provide_tunnel_dns: "Provide in-tunnel DNS service for clients (virtual IP:53)"
+provide_tunnel_dns_help: |
+  Only effective on an exit node. When checked, the exit node serves DNS for clients on port 53 of its virtual IP (recommended).
+  Unchecking it is equivalent to disable_exit_dns = true in the config.
+provide_tunnel_dns_only_exit_node: Only effective when this node is enabled as an exit node (see "Advanced Settings - Feature Switch").
+
 relay_network_whitelist: Network Whitelist
 relay_network_whitelist_help: |
   Only forward traffic from the whitelist networks, supporting wildcard strings, multiple network names can be separated by spaces.
