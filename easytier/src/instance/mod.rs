@@ -3,6 +3,7 @@ pub mod dns_server;
 pub mod instance;
 
 pub mod listeners;
+pub mod peer_route_exclude;
 
 mod public_ipv6_provider;
 

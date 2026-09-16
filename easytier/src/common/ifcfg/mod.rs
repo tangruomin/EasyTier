@@ -10,6 +10,7 @@ mod win;
 #[cfg(target_os = "windows")]
 mod windows;
 
+pub mod peer_exclude;
 mod route;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
