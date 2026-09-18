@@ -168,6 +168,36 @@ export interface NetworkConfig {
   // serves DNS on virtual IP:53.
   disable_exit_dns?: boolean
 
+  // ---------------------------------------------------------------------------
+  // WG 混淆（抗 DPI）：仅对 wg:// 隧道生效。
+  // WG obfuscation (anti-DPI); only affects wg:// tunnels.
+  // ---------------------------------------------------------------------------
+  // 总开关，默认关闭：false / 未设置 = 使用原生 WireGuard，行为与之前完全一致。
+  // 开启后隧道两端必须使用完全相同的混淆参数，且不再兼容旧版本节点与公网服务器。
+  // Master switch, off by default: false / unset = plain WireGuard, identical to before.
+  // Once enabled, both ends must use exactly the same parameters, and old nodes / public
+  // servers are no longer compatible.
+  wg_obfs?: boolean
+  // 以下 7 个混淆参数均为可选：
+  //   * 未设置（undefined / null）= 使用代码内置默认值
+  //     （S1=37、S2=42、S3=19、S4=11、Jc=4、Jmin=200、Jmax=260，见 WG_OBFS_DEFAULTS）；
+  //   * 显式填 0 = 该字段不做填充 / 不发送 junk（与“未设置”含义不同）。
+  // 合法范围：S1/S2/S3 0-64、S4 0-32、Jc 0-10、Jmin/Jmax 64-1024 且 Jmin <= Jmax，
+  // 并且 [Jmin,Jmax] 不得包含 148+S1 / 92+S2 / 64+S3。
+  // All 7 obfuscation parameters below are optional:
+  //   * unset (undefined / null) = use the built-in defaults
+  //     (S1=37, S2=42, S3=19, S4=11, Jc=4, Jmin=200, Jmax=260; see WG_OBFS_DEFAULTS);
+  //   * an explicit 0 = no padding / no junk for that field (this differs from "unset").
+  // Valid ranges: S1/S2/S3 0-64, S4 0-32, Jc 0-10, Jmin/Jmax 64-1024 with Jmin <= Jmax, and
+  // [Jmin,Jmax] must not contain 148+S1 / 92+S2 / 64+S3.
+  wg_obfs_s1?: number
+  wg_obfs_s2?: number
+  wg_obfs_s3?: number
+  wg_obfs_s4?: number
+  wg_obfs_jc?: number
+  wg_obfs_jmin?: number
+  wg_obfs_jmax?: number
+
   port_forwards: PortForwardConfig[]
   acl?: Acl
 }
@@ -216,6 +246,131 @@ export function parseDnsServersText(text: string | undefined): string[] {
 /** 将 DNS 服务器列表序列化为逗号分隔文本。 / Serialize a DNS server list as comma-separated text. */
 export function formatDnsServersText(servers: string[] | undefined): string {
   return cleanDnsServers(servers).join(', ')
+}
+
+// ---------------------------------------------------------------------------
+// WG 混淆（抗 DPI）参数的常量与工具
+// Constants and helpers for the WG obfuscation (anti-DPI) parameters.
+// ---------------------------------------------------------------------------
+
+/** WG 混淆中可写的 7 个参数字段名。 / The 7 writable WG obfuscation parameter field names. */
+export type WgObfsField =
+  | 'wg_obfs_s1'
+  | 'wg_obfs_s2'
+  | 'wg_obfs_s3'
+  | 'wg_obfs_s4'
+  | 'wg_obfs_jc'
+  | 'wg_obfs_jmin'
+  | 'wg_obfs_jmax'
+
+/** 单个参数的规格：内置默认值 + 合法范围。 / Spec of one parameter: built-in default + valid range. */
+export interface WgObfsParamSpec {
+  /** 未设置该字段时使用的内置默认值（与后端代码内默认值一致）。 */
+  /** Built-in default used when the field is unset (identical to the backend default). */
+  default: number
+  /** 合法下界（含）。 / Inclusive lower bound. */
+  min: number
+  /** 合法上界（含）。 / Inclusive upper bound. */
+  max: number
+}
+
+/**
+ * 7 个 WG 混淆参数的内置默认值与合法范围，供界面显示提示、钳制用户输入使用。
+ * 未设置（undefined / null）时后端使用这些默认值：S1=37、S2=42、S3=19、S4=11、Jc=4、
+ * Jmin=200、Jmax=260；显式填 0 表示该字段不做填充 / 不发送 junk。
+ * Built-in defaults and valid ranges of the 7 WG obfuscation parameters, used by the UI for
+ * placeholders and input clamping. When a field is unset (undefined / null) the backend uses
+ * these defaults: S1=37, S2=42, S3=19, S4=11, Jc=4, Jmin=200, Jmax=260. An explicit 0 means
+ * "no padding / no junk" for that field.
+ */
+export const WG_OBFS_DEFAULTS: Record<WgObfsField, WgObfsParamSpec> = {
+  wg_obfs_s1: { default: 37, min: 0, max: 64 },
+  wg_obfs_s2: { default: 42, min: 0, max: 64 },
+  wg_obfs_s3: { default: 19, min: 0, max: 64 },
+  wg_obfs_s4: { default: 11, min: 0, max: 32 },
+  wg_obfs_jc: { default: 4, min: 0, max: 10 },
+  wg_obfs_jmin: { default: 200, min: 64, max: 1024 },
+  wg_obfs_jmax: { default: 260, min: 64, max: 1024 },
+}
+
+/**
+ * junk 探针偏移量：junk 长度区间 [Jmin,Jmax] 不得包含 148+S1 / 92+S2 / 64+S3，
+ * 否则后端会关闭 junk 填充并告警。
+ * Junk probe offsets: [Jmin,Jmax] must not contain 148+S1 / 92+S2 / 64+S3, otherwise the
+ * backend disables junk padding and emits a warning.
+ */
+export const WG_OBFS_JUNK_PROBE_OFFSETS: Record<'s1' | 's2' | 's3', number> = {
+  s1: 148,
+  s2: 92,
+  s3: 64,
+}
+
+/**
+ * 把用户输入钳制到该字段的合法范围内。
+ * 留空 / 非数字 / 非有限值返回 undefined（= 该字段不该被写入，让后端使用内置默认值）；
+ * 超出范围时返回边界值（而不是 undefined）。注意 0 是合法输入，必须原样保留。
+ * Clamp user input into the valid range of the field.
+ * Empty / non-numeric / non-finite input returns undefined (= the field should not be written at
+ * all, so the backend keeps its built-in default); out-of-range input returns the bound (not
+ * undefined). Note that 0 is a valid value and must be preserved as-is.
+ */
+export function clampWgObfsValue(field: WgObfsField, value: unknown): number | undefined {
+  const spec = WG_OBFS_DEFAULTS[field]
+  if (value === undefined || value === null || value === '') {
+    return undefined
+  }
+
+  const num = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(num)) {
+    return undefined
+  }
+
+  const int = Math.round(num)
+  if (int < spec.min) {
+    return spec.min
+  }
+  if (int > spec.max) {
+    return spec.max
+  }
+  return int
+}
+
+/** junk 区间冲突检查的输入；未设置的字段按内置默认值参与计算。 */
+/** Input of the junk range check; unset fields participate with their built-in defaults. */
+export interface WgObfsJunkRangeInput {
+  s1?: number | null
+  s2?: number | null
+  s3?: number | null
+  jmin?: number | null
+  jmax?: number | null
+}
+
+/**
+ * 返回落在 [Jmin,Jmax] 区间内的 junk 探针值（去重、升序）。
+ * 未设置的参数用 WG_OBFS_DEFAULTS 的内置默认值参与计算（与后端行为一致）；
+ * 返回非空数组表示后端会关闭 junk 填充并告警，界面应提示用户改参数。
+ * Returns the (deduplicated, ascending) junk probe values that fall inside [Jmin, Jmax].
+ * Unset parameters participate with their built-in WG_OBFS_DEFAULTS value, matching the
+ * backend. A non-empty result means the backend disables junk padding and warns, so the UI
+ * should ask the user to change the parameters.
+ */
+export function wgObfsJunkProbeConflicts(input: WgObfsJunkRangeInput): number[] {
+  const pick = (value: number | null | undefined, fallback: number): number =>
+    value === undefined || value === null ? fallback : value
+
+  const jmin = pick(input.jmin, WG_OBFS_DEFAULTS.wg_obfs_jmin.default)
+  const jmax = pick(input.jmax, WG_OBFS_DEFAULTS.wg_obfs_jmax.default)
+  const low = Math.min(jmin, jmax)
+  const high = Math.max(jmin, jmax)
+
+  const probes = [
+    WG_OBFS_JUNK_PROBE_OFFSETS.s1 + pick(input.s1, WG_OBFS_DEFAULTS.wg_obfs_s1.default),
+    WG_OBFS_JUNK_PROBE_OFFSETS.s2 + pick(input.s2, WG_OBFS_DEFAULTS.wg_obfs_s2.default),
+    WG_OBFS_JUNK_PROBE_OFFSETS.s3 + pick(input.s3, WG_OBFS_DEFAULTS.wg_obfs_s3.default),
+  ]
+
+  return Array.from(new Set(probes.filter((probe) => probe >= low && probe <= high)))
+    .sort((a, b) => a - b)
 }
 
 export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
@@ -288,6 +443,12 @@ export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
     dns_mode: DNS_MODE_AUTO,
     dns_servers: [],
     disable_exit_dns: false,
+    // WG 混淆总开关默认关闭；其余 7 个参数保持 undefined（= 使用内置默认值）。
+    // 这里绝不能写 0，0 表示“显式关闭该项填充”，与“用内置默认值”含义不同。
+    // WG obfuscation is off by default; the other 7 parameters stay undefined (= built-in
+    // defaults). Never write 0 here: 0 means "explicitly disable that padding", which is not
+    // the same as "use the built-in default".
+    wg_obfs: false,
     port_forwards: [],
     acl: {
       acl_v1: {
@@ -332,6 +493,14 @@ export function normalizeNetworkConfig(config: NetworkConfig): NetworkConfig {
   // hit different code paths on the backend.
   normalized.dns_mode = getDnsMode(normalized)
   normalized.dns_servers = cleanDnsServers(normalized.dns_servers)
+  // WG 混淆：只把总开关规范化为布尔（!!），未设置按关闭处理。
+  // 7 个参数保持原样（undefined = 使用后端内置默认值），这里绝不填默认数字，
+  // 也不会把 undefined 变成 0，否则就无法区分“留空”和“用户显式填 0”。
+  // WG obfuscation: only coerce the master switch to a boolean (!!); unset counts as off.
+  // The 7 parameters are left untouched (undefined = use the backend built-in default). Never
+  // fill in default numbers here and never turn undefined into 0, otherwise "left empty" and
+  // "the user explicitly typed 0" could not be told apart.
+  normalized.wg_obfs = !!normalized.wg_obfs
   return normalized
 }
 

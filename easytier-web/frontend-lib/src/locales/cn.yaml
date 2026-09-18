@@ -203,6 +203,26 @@ provide_tunnel_dns_help: |
   取消勾选等价于配置中的 disable_exit_dns = true。
 provide_tunnel_dns_only_exit_node: 仅当本节点启用为出口节点时生效（可在“高级设置 - 功能开关”中开启出口节点）。
 
+wg_obfs_settings: WG 混淆（抗 DPI）
+wg_obfs: 开启 WG 混淆（抗 DPI）
+wg_obfs_help: |
+  仅对 wg:// 隧道生效。开启后会对 WireGuard 数据包做填充与随机 junk 混淆，用于对抗 DPI 识别与流量指纹。
+  默认关闭（wg_obfs 未设置 / false）= 使用原生 WireGuard，行为与之前完全一致。
+wg_obfs_s1: S1（握手前填充，0-64）
+wg_obfs_s2: S2（响应填充，0-64）
+wg_obfs_s3: S3（Cookie 填充，0-64）
+wg_obfs_s4: S4（传输数据填充，0-32）
+wg_obfs_jc: Jc（每个数据包发送的 junk 数量，0-10）
+wg_obfs_jmin: Jmin（junk 长度下界，64-1024）
+wg_obfs_jmax: Jmax（junk 长度上界，64-1024）
+wg_obfs_params_help: |
+  留空 = 使用内置默认值（S1=37、S2=42、S3=19、S4=11、Jc=4、Jmin=200、Jmax=260）；
+  填 0 = 该字段不做填充 / 不发送 junk（与留空含义不同，不要混用）。
+  合法范围：S1/S2/S3 为 0-64，S4 为 0-32，Jc 为 0-10，Jmin/Jmax 为 64-1024 且必须 Jmin <= Jmax。
+  注意：Jmin~Jmax 区间不得包含 148+S1、92+S2、64+S3，否则后端会关闭 junk 填充并告警。
+wg_obfs_incompatible_warning: 开启混淆后，wg 隧道两端必须使用完全相同的混淆参数；并且不再兼容旧版本节点与公网服务器（这是预期行为）。
+wg_obfs_junk_conflict_warning: "当前 Jmin~Jmax 区间包含探针值 {0}（= 148+S1 / 92+S2 / 64+S3），后端会关闭 junk 填充并告警；请调整 Jmin/Jmax，或修改 S1/S2/S3。"
+
 relay_network_whitelist: 网络白名单
 relay_network_whitelist_help: |
   仅转发白名单网络的流量，支持通配符字符串。多个网络名称间可以使用英文空格间隔。

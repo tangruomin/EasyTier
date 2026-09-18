@@ -4,6 +4,7 @@ import InputGroup from 'primevue/inputgroup'
 import InputGroupAddon from 'primevue/inputgroupaddon'
 import {
   addRow,
+  clampWgObfsValue,
   DEFAULT_NETWORK_CONFIG,
   DNS_MODE_AUTO,
   DNS_MODE_CUSTOM,
@@ -13,7 +14,10 @@ import {
   NetworkConfig,
   normalizeNetworkConfig,
   parseDnsServersText,
-  removeRow
+  removeRow,
+  WG_OBFS_DEFAULTS,
+  WgObfsField,
+  wgObfsJunkProbeConflicts
 } from '../types/network'
 import { computed, ref, onMounted, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -224,6 +228,87 @@ const dnsModeHelp = computed(() => {
       return t('dns_mode_auto_help')
   }
 })
+
+// ---------------------------------------------------------------------------
+// WG 混淆（抗 DPI）：wg_obfs + 7 个参数
+// 表单只在用户真正改动时才写回字段；输入框被清空 = 删除该字段（写 undefined），
+// 让后端回落到内置默认值，绝不写 0（0 表示“显式关闭该项填充”，是另一种含义）。
+// WG obfuscation (anti-DPI): wg_obfs + the 7 parameters.
+// The form only writes a field back once the user actually changes it; an emptied input removes
+// the field (undefined) so the backend falls back to its built-in default, and never writes 0
+// (0 means "explicitly disable that padding", which is a different meaning).
+// ---------------------------------------------------------------------------
+
+/** 总开关：未设置按关闭处理。 / Master switch; unset counts as off. */
+const wgObfsEnabled = computed({
+  get: () => !!curNetwork.value?.wg_obfs,
+  set: (value: boolean) => {
+    if (!curNetwork.value) {
+      return
+    }
+    curNetwork.value.wg_obfs = !!value
+  },
+})
+
+/** 参数输入框的占位文本 = 内置默认值。 / Placeholder text of a parameter input = built-in default. */
+function wgObfsPlaceholder(field: WgObfsField): string {
+  return String(WG_OBFS_DEFAULTS[field].default)
+}
+
+/**
+ * 写回单个参数：先按范围钳制；留空 / 非法输入（钳制结果为 undefined）则删除字段，
+ * 使后端使用内置默认值；显式输入的 0 会被保留。
+ * Write one parameter back: clamp it to its range first; empty / invalid input (clamped to
+ * undefined) removes the field so the backend uses its built-in default; an explicit 0 is kept.
+ */
+function setWgObfsParam(field: WgObfsField, value: number | null): void {
+  const network = curNetwork.value
+  if (!network) {
+    return
+  }
+
+  // 通过 Partial<Record<...>> 视图删除可选字段：用 delete 而不是写 undefined，
+  // 这样配置对象里不会残留值为 undefined 的键（JSON / TOML 序列化时更干净）。
+  // A Partial<Record<...>> view lets us delete optional fields; using delete instead of
+  // assigning undefined keeps the config object free of undefined-valued keys.
+  const params = network as unknown as Partial<Record<WgObfsField, number>>
+
+  const clamped = clampWgObfsValue(field, value)
+  if (clamped === undefined) {
+    delete params[field]
+    return
+  }
+  params[field] = clamped
+}
+
+/** 单个参数的双向绑定：读配置（未设置显示为空），写回时钳制 / 删除。 */
+/** Two-way binding of one parameter: read the config (unset renders empty), clamp/remove on write. */
+function wgObfsParam(field: WgObfsField) {
+  return computed<number | null>({
+    get: () => curNetwork.value?.[field] ?? null,
+    set: (value: number | null) => setWgObfsParam(field, value),
+  })
+}
+
+const wgObfsS1 = wgObfsParam('wg_obfs_s1')
+const wgObfsS2 = wgObfsParam('wg_obfs_s2')
+const wgObfsS3 = wgObfsParam('wg_obfs_s3')
+const wgObfsS4 = wgObfsParam('wg_obfs_s4')
+const wgObfsJc = wgObfsParam('wg_obfs_jc')
+const wgObfsJmin = wgObfsParam('wg_obfs_jmin')
+const wgObfsJmax = wgObfsParam('wg_obfs_jmax')
+
+/**
+ * 落在 [Jmin,Jmax] 内的 junk 探针值（148+S1 / 92+S2 / 64+S3）；非空表示后端会关闭 junk 并告警。
+ * Junk probe values inside [Jmin, Jmax]; a non-empty list means the backend disables junk padding.
+ */
+const wgObfsJunkConflicts = computed(() => wgObfsJunkProbeConflicts({
+  s1: curNetwork.value?.wg_obfs_s1,
+  s2: curNetwork.value?.wg_obfs_s2,
+  s3: curNetwork.value?.wg_obfs_s3,
+  jmin: curNetwork.value?.wg_obfs_jmin,
+  jmax: curNetwork.value?.wg_obfs_jmax,
+}))
 
 function syncNormalizedNetwork(network: NetworkConfig | undefined): void {
   if (!network) {
@@ -516,6 +601,85 @@ watch(() => curNetwork.value, syncNormalizedNetwork, { immediate: true, deep: fa
                     {{ t('provide_tunnel_dns_only_exit_node') }}
                   </small>
                 </div>
+              </div>
+            </div>
+          </Panel>
+
+          <Divider />
+
+          <Panel :header="t('wg_obfs_settings')" toggleable collapsed>
+            <div class="flex flex-col gap-y-2">
+              <div class="flex flex-row gap-x-9 flex-wrap">
+                <div class="flex flex-col gap-2 basis-5/12 grow">
+                  <div class="flex items-center">
+                    <Checkbox v-model="wgObfsEnabled" input-id="wg_obfs" :binary="true" />
+                    <label for="wg_obfs" class="ml-2"> {{ t('wg_obfs') }} </label>
+                    <span class="pi pi-question-circle ml-2 self-center" v-tooltip="t('wg_obfs_help')"></span>
+                  </div>
+                  <!-- 醒目提示：两端参数必须一致，且不再兼容旧节点 / 公网服务器。
+                       Always visible inside the panel, not gated on the checkbox, so the user
+                       reads the incompatibility warning before enabling obfuscation. -->
+                  <small class="text-red-500 font-semibold whitespace-pre-wrap">
+                    <i class="pi pi-exclamation-triangle mr-1"></i>{{ t('wg_obfs_incompatible_warning') }}
+                  </small>
+                </div>
+              </div>
+
+              <!-- 未勾选总开关时不显示 7 个参数输入框（未设置 = 使用内置默认值）。 -->
+              <!-- The 7 parameter inputs are hidden while the master switch is off. -->
+              <div v-if="wgObfsEnabled" class="flex flex-col gap-y-2">
+                <div class="flex flex-row gap-x-9 flex-wrap">
+                  <div class="flex flex-col gap-2 basis-5/12 grow">
+                    <label for="wg_obfs_s1">{{ t('wg_obfs_s1') }}</label>
+                    <InputNumber id="wg_obfs_s1" v-model="wgObfsS1" :allow-empty="true"
+                      :placeholder="wgObfsPlaceholder('wg_obfs_s1')" :format="false"
+                      :min="WG_OBFS_DEFAULTS.wg_obfs_s1.min" :max="WG_OBFS_DEFAULTS.wg_obfs_s1.max" fluid />
+                  </div>
+                  <div class="flex flex-col gap-2 basis-5/12 grow">
+                    <label for="wg_obfs_s2">{{ t('wg_obfs_s2') }}</label>
+                    <InputNumber id="wg_obfs_s2" v-model="wgObfsS2" :allow-empty="true"
+                      :placeholder="wgObfsPlaceholder('wg_obfs_s2')" :format="false"
+                      :min="WG_OBFS_DEFAULTS.wg_obfs_s2.min" :max="WG_OBFS_DEFAULTS.wg_obfs_s2.max" fluid />
+                  </div>
+                  <div class="flex flex-col gap-2 basis-5/12 grow">
+                    <label for="wg_obfs_s3">{{ t('wg_obfs_s3') }}</label>
+                    <InputNumber id="wg_obfs_s3" v-model="wgObfsS3" :allow-empty="true"
+                      :placeholder="wgObfsPlaceholder('wg_obfs_s3')" :format="false"
+                      :min="WG_OBFS_DEFAULTS.wg_obfs_s3.min" :max="WG_OBFS_DEFAULTS.wg_obfs_s3.max" fluid />
+                  </div>
+                  <div class="flex flex-col gap-2 basis-5/12 grow">
+                    <label for="wg_obfs_s4">{{ t('wg_obfs_s4') }}</label>
+                    <InputNumber id="wg_obfs_s4" v-model="wgObfsS4" :allow-empty="true"
+                      :placeholder="wgObfsPlaceholder('wg_obfs_s4')" :format="false"
+                      :min="WG_OBFS_DEFAULTS.wg_obfs_s4.min" :max="WG_OBFS_DEFAULTS.wg_obfs_s4.max" fluid />
+                  </div>
+                  <div class="flex flex-col gap-2 basis-5/12 grow">
+                    <label for="wg_obfs_jc">{{ t('wg_obfs_jc') }}</label>
+                    <InputNumber id="wg_obfs_jc" v-model="wgObfsJc" :allow-empty="true"
+                      :placeholder="wgObfsPlaceholder('wg_obfs_jc')" :format="false"
+                      :min="WG_OBFS_DEFAULTS.wg_obfs_jc.min" :max="WG_OBFS_DEFAULTS.wg_obfs_jc.max" fluid />
+                  </div>
+                  <div class="flex flex-col gap-2 basis-5/12 grow">
+                    <label for="wg_obfs_jmin">{{ t('wg_obfs_jmin') }}</label>
+                    <InputNumber id="wg_obfs_jmin" v-model="wgObfsJmin" :allow-empty="true"
+                      :placeholder="wgObfsPlaceholder('wg_obfs_jmin')" :format="false"
+                      :min="WG_OBFS_DEFAULTS.wg_obfs_jmin.min" :max="WG_OBFS_DEFAULTS.wg_obfs_jmin.max" fluid />
+                  </div>
+                  <div class="flex flex-col gap-2 basis-5/12 grow">
+                    <label for="wg_obfs_jmax">{{ t('wg_obfs_jmax') }}</label>
+                    <InputNumber id="wg_obfs_jmax" v-model="wgObfsJmax" :allow-empty="true"
+                      :placeholder="wgObfsPlaceholder('wg_obfs_jmax')" :format="false"
+                      :min="WG_OBFS_DEFAULTS.wg_obfs_jmax.min" :max="WG_OBFS_DEFAULTS.wg_obfs_jmax.max" fluid />
+                  </div>
+                </div>
+
+                <small class="p-text-secondary whitespace-pre-wrap">{{ t('wg_obfs_params_help') }}</small>
+                <!-- 动态检测 junk 区间与 148+S1 / 92+S2 / 64+S3 的重合。 -->
+                <!-- Dynamic check: does [Jmin,Jmax] contain 148+S1 / 92+S2 / 64+S3? -->
+                <small v-if="wgObfsJunkConflicts.length > 0" class="text-red-500 font-semibold whitespace-pre-wrap">
+                  <i class="pi pi-exclamation-triangle mr-1"></i>{{ t('wg_obfs_junk_conflict_warning',
+                    [wgObfsJunkConflicts.join(', ')]) }}
+                </small>
               </div>
             </div>
           </Panel>

@@ -202,6 +202,28 @@ provide_tunnel_dns_help: |
   Unchecking it is equivalent to disable_exit_dns = true in the config.
 provide_tunnel_dns_only_exit_node: Only effective when this node is enabled as an exit node (see "Advanced Settings - Feature Switch").
 
+wg_obfs_settings: WG Obfuscation (Anti-DPI)
+wg_obfs: Enable WG obfuscation (anti-DPI)
+wg_obfs_help: |
+  Only affects wg:// tunnels. When enabled, WireGuard packets get padding and random junk
+  obfuscation to defeat DPI fingerprinting.
+  Off by default (wg_obfs unset / false) = plain WireGuard, identical to the previous behaviour.
+wg_obfs_s1: S1 (pre-handshake padding, 0-64)
+wg_obfs_s2: S2 (response padding, 0-64)
+wg_obfs_s3: S3 (cookie padding, 0-64)
+wg_obfs_s4: S4 (transport data padding, 0-32)
+wg_obfs_jc: Jc (junk packets sent per data packet, 0-10)
+wg_obfs_jmin: Jmin (minimum junk length, 64-1024)
+wg_obfs_jmax: Jmax (maximum junk length, 64-1024)
+wg_obfs_params_help: |
+  Empty = use the built-in default (S1=37, S2=42, S3=19, S4=11, Jc=4, Jmin=200, Jmax=260);
+  0 = no padding / no junk for that field (which is NOT the same meaning as leaving it empty).
+  Valid ranges: S1/S2/S3 0-64, S4 0-32, Jc 0-10, Jmin/Jmax 64-1024 with Jmin <= Jmax required.
+  Note: the Jmin~Jmax range must not contain 148+S1, 92+S2 or 64+S3, otherwise the backend
+  disables junk padding and emits a warning.
+wg_obfs_incompatible_warning: Once obfuscation is enabled, both ends of the wg tunnel must use exactly the same obfuscation parameters, and old nodes / public servers are no longer compatible (this is expected).
+wg_obfs_junk_conflict_warning: "The current Jmin~Jmax range contains probe value(s) {0} (= 148+S1 / 92+S2 / 64+S3). The backend will disable junk padding and emit a warning; adjust Jmin/Jmax or S1/S2/S3."
+
 relay_network_whitelist: Network Whitelist
 relay_network_whitelist_help: |
   Only forward traffic from the whitelist networks, supporting wildcard strings, multiple network names can be separated by spaces.
