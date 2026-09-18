@@ -1,0 +1,333 @@
+name: Verify 3 Endpoints (round3)
+
+# =============================================================================
+# 第三轮修复（WG 混淆 + 连接生命周期 + 魔法 DNS 阻塞修复）验收专用验证 workflow
+#
+# 为什么需要它：
+#   core.yml 的 build 矩阵设置了 strategy.fail-fast: true，而
+#   arm-unknown-linux-musleabihf 上的第三方 C 依赖 tikv-jemalloc-sys 在
+#   zig 0.16.0 下必然失败（zig 不认 rustc 的 -mcpu=generic+v6+strict_align+vfp2-d32），
+#   失败瞬间会把同批启动的 x86_64-pc-windows-msvc / x86_64-unknown-linux-musl
+#   两个 job 一起 cancelled，导致三端产物拿不到。
+#
+# 本 workflow 的做法：
+#   每个 (branch, endpoint) 组合都是一个独立 job，strategy.fail-fast: false，
+#   互不牵连，且完全不使用 skip-duplicate-actions，因此不会被去重跳过。
+#
+# 构建步骤与 core.yml / gui.yml / mobile.yml 对应 job 完全一致。
+# 触发方式：向 fix/wg-obfs-lifecycle 分支 push，或 workflow_dispatch。
+#
+# matrix 的 REF：本轮为单一修复分支 `fix/round2-dns-exit`（TAG: round3），
+#   对其出 Windows 命令行版 / Windows GUI / Android arm64 / Linux core 四个产物。
+#   若要复验其它分支，把 REF 改回分支名即可。
+# =============================================================================
+
+on:
+  push:
+    branches: [ "fix/wg-obfs-lifecycle" ]
+  workflow_dispatch:
+
+concurrency:
+  group: verify-round3-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    # necessary for windows
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 端 1-a：Windows x86_64 —— easytier-core / easytier-cli / easytier-web
+  # ---------------------------------------------------------------------------
+  core-windows-x86_64:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 三个修复分支已按 p1 → p2 → p3 合并进 develop（--no-ff，无冲突），
+          # 此处对集成结果 develop 出三端产物。
+          - REF: fix/wg-obfs-lifecycle
+            TAG: round3
+    runs-on: windows-latest
+    env:
+      NAME: easytier
+      TARGET: x86_64-pc-windows-msvc
+      OS: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.REF }}
+
+      - name: Set current ref as env variable
+        run: |
+          echo "GIT_DESC=$(git log -1 --format=%cd.%h --date=format:%Y-%m-%d_%H:%M:%S)" >> $GITHUB_ENV
+
+      - name: Prepare build environment
+        uses: ./.github/actions/prepare-build
+        with:
+          target: x86_64-pc-windows-msvc
+          gui: true
+          pnpm: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ""
+          shared-key: "core-registry"
+          cache-targets: "false"
+
+      - name: Build
+        run: |
+          SUFFIX=.exe
+          FEATURES=mimalloc
+
+          cargo build --release --target $TARGET --package=easytier-web --features=embed
+          mv ./target/$TARGET/release/easytier-web"$SUFFIX" ./target/$TARGET/release/easytier-web-embed"$SUFFIX"
+
+          cargo build --release --target $TARGET --features=$FEATURES
+
+      - name: Compress
+        run: |
+          mkdir -p ./artifacts/objects/
+          SUFFIX=.exe
+
+          find "easytier/third_party/x86_64" -maxdepth 1 -type f \( -name "*.dll" -o -name "*.sys" \) -exec cp {} ./artifacts/objects/ \;
+
+          for BIN in ./target/$TARGET/release/easytier-{core,cli,web,web-embed}"$SUFFIX"; do
+            if [[ -f "$BIN" ]]; then
+              mv "$BIN" ./artifacts/objects/
+            fi
+          done
+
+          mv ./artifacts/objects/* ./artifacts/
+          rm -rf ./artifacts/objects/
+
+      - name: Archive artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: verify-easytier-windows-x86_64-${{ matrix.TAG }}
+          path: |
+            ./artifacts/*
+
+  # ---------------------------------------------------------------------------
+  # 端 1-b：Windows x86_64 GUI（Tauri / NSIS 安装包）
+  # ---------------------------------------------------------------------------
+  gui-windows-x86_64:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 三个修复分支已按 p1 → p2 → p3 合并进 develop（--no-ff，无冲突），
+          # 此处对集成结果 develop 出三端产物。
+          - REF: fix/wg-obfs-lifecycle
+            TAG: round3
+    runs-on: windows-latest
+    env:
+      NAME: easytier
+      TARGET: x86_64-pc-windows-msvc
+      OS: windows-latest
+      GUI_TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.REF }}
+
+      - name: Set current ref as env variable
+        run: |
+          echo "GIT_DESC=$(git log -1 --format=%cd.%h --date=format:%Y-%m-%d_%H:%M:%S)" >> $GITHUB_ENV
+
+      - name: Prepare build environment
+        uses: ./.github/actions/prepare-build
+        with:
+          target: x86_64-pc-windows-msvc
+          gui: true
+          pnpm: true
+          pnpm-build-filter: ''
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ""
+          shared-key: "gui-registry"
+          cache-targets: "false"
+
+      - name: copy correct DLLs
+        run: |
+          find "./easytier/third_party/x86_64" -maxdepth 1 -type f \( -name "*.dll" -o -name "*.sys" \) -exec cp {} ./easytier-gui/src-tauri/ \;
+
+      - name: Build GUI
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: ./easytier-gui
+          args: --verbose --target x86_64-pc-windows-msvc
+
+      - name: Collect artifact
+        run: |
+          mkdir -p ./artifacts/objects/
+          mv ./target/$GUI_TARGET/release/bundle/nsis/*.exe ./artifacts/objects/
+          mv ./artifacts/objects/* ./artifacts/
+          rm -rf ./artifacts/objects/
+
+      - name: Archive artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: verify-easytier-gui-windows-x86_64-${{ matrix.TAG }}
+          path: |
+            ./artifacts/*
+
+  # ---------------------------------------------------------------------------
+  # 端 2：Linux x86_64 —— easytier-core / easytier-cli（musl 静态）
+  # ---------------------------------------------------------------------------
+  core-linux-x86_64:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 三个修复分支已按 p1 → p2 → p3 合并进 develop（--no-ff，无冲突），
+          # 此处对集成结果 develop 出三端产物。
+          - REF: fix/wg-obfs-lifecycle
+            TAG: round3
+    runs-on: ubuntu-24.04
+    env:
+      NAME: easytier
+      TARGET: x86_64-unknown-linux-musl
+      OS: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.REF }}
+
+      - name: Set current ref as env variable
+        run: |
+          echo "GIT_DESC=$(git log -1 --format=%cd.%h --date=format:%Y-%m-%d_%H:%M:%S)" >> $GITHUB_ENV
+
+      - name: Prepare build environment
+        uses: ./.github/actions/prepare-build
+        with:
+          target: x86_64-unknown-linux-musl
+          gui: true
+          pnpm: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ""
+          shared-key: "core-registry"
+          cache-targets: "false"
+
+      - name: Build
+        run: |
+          FEATURES=jemalloc
+
+          cargo build --release --target $TARGET --package=easytier-web --features=embed
+          mv ./target/$TARGET/release/easytier-web ./target/$TARGET/release/easytier-web-embed
+
+          cargo build --release --target $TARGET --features=$FEATURES
+
+      - name: Compress
+        run: |
+          mkdir -p ./artifacts/objects/
+
+          UPX_VERSION=4.2.4
+          UPX_PKG="upx-${UPX_VERSION}-amd64_linux"
+          curl -L "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/${UPX_PKG}.tar.xz" -s | tar xJvf -
+          cp "${UPX_PKG}/upx" .
+          UPX_BIN=./upx
+
+          for BIN in ./target/$TARGET/release/easytier-{core,cli,web,web-embed}; do
+            if [[ -f "$BIN" ]]; then
+              $UPX_BIN --lzma --best "$BIN" || true
+              mv "$BIN" ./artifacts/objects/
+            fi
+          done
+
+          mv ./artifacts/objects/* ./artifacts/
+          rm -rf ./artifacts/objects/
+
+      - name: Archive artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: verify-easytier-linux-x86_64-${{ matrix.TAG }}
+          path: |
+            ./artifacts/*
+
+  # ---------------------------------------------------------------------------
+  # 端 3：Android arm64（aarch64-linux-android，APK）
+  # ---------------------------------------------------------------------------
+  mobile-android-aarch64:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 三个修复分支已按 p1 → p2 → p3 合并进 develop（--no-ff，无冲突），
+          # 此处对集成结果 develop 出三端产物。
+          - REF: fix/wg-obfs-lifecycle
+            TAG: round3
+    runs-on: ubuntu-latest
+    env:
+      NAME: easytier
+      TARGET: aarch64-linux-android
+      ARCH: aarch64
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.REF }}
+
+      - name: Set current ref as env variable
+        run: |
+          echo "GIT_DESC=$(git log -1 --format=%cd.%h --date=format:%Y-%m-%d_%H:%M:%S)" >> $GITHUB_ENV
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'oracle'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 12.0
+          packages: 'build-tools;34.0.0 ndk;26.0.10792818 platform-tools platforms;android-34 '
+
+      - name: Setup Android Environment
+        run: |
+          echo "$ANDROID_HOME/platform-tools" >> $GITHUB_PATH
+          echo "$ANDROID_HOME/ndk/26.0.10792818/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+          echo "NDK_HOME=$ANDROID_HOME/ndk/26.0.10792818/" >> $GITHUB_ENV
+
+      - name: Prepare build environment
+        uses: ./.github/actions/prepare-build
+        with:
+          target: aarch64-linux-android
+          gui: false
+          pnpm: true
+          pnpm-build-filter: ''
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ""
+          shared-key: "gui-registry"
+          cache-targets: "false"
+
+      - name: Build
+        run: |
+          cd easytier-gui
+          pnpm tauri android build --apk --target "$ARCH" --split-per-abi
+
+      - name: Collect artifact
+        run: |
+          mkdir -p ./artifacts/objects/
+          mv easytier-gui/src-tauri/gen/android/app/build/outputs/apk/*/release/*.apk ./artifacts/objects/
+          mv ./artifacts/objects/* ./artifacts/
+          rm -rf ./artifacts/objects/
+
+      - name: Archive artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: verify-easytier-mobile-android-aarch64-${{ matrix.TAG }}
+          path: |
+            ./artifacts/*
