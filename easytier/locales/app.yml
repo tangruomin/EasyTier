@@ -235,6 +235,30 @@ core_clap:
   disable_exit_dns:
     en: "set to true to disable the dns service that an exit node provides to clients on its virtual ip port 53. by default an exit node always serves dns to clients so that they can resolve domains through the tunnel."
     zh-CN: "设为 true 可关闭出口节点在虚拟 IP 的 53 端口为客户端提供的 DNS 服务。默认情况下出口节点始终提供该服务，便于客户端经隧道解析域名。"
+  wg_obfs:
+    en: "enable wireguard obfuscation (amneziawg-style s1-s4 padding and jc/jmin/jmax junk packets) to survive dpi that drops native wireguard handshakes. default false (native wireguard). when enabled BOTH ends of a wg tunnel must use exactly the same obfuscation parameters, and wg will no longer interoperate with nodes running older versions or with public servers. start by enabling only this switch: the built-in default values (s1=37 s2=42 s3=19 s4=11 jc=4 jmin=200 jmax=260) are used unless a parameter is set explicitly."
+    zh-CN: "开启 WireGuard 混淆（AmneziaWG 式 S1-S4 填充 + Jc/Jmin/Jmax junk 包），用于对抗会丢弃原生 wg 握手的 DPI。默认关闭（原生 wg）。开启后，wg 隧道两端必须使用完全相同的混淆参数，且 wg 不再兼容旧版本节点/公网服务器。建议只打开本开关：除显式设置的参数外，其余使用代码内置默认值（S1=37 S2=42 S3=19 S4=11 Jc=4 Jmin=200 Jmax=260）。"
+  wg_obfs_s1:
+    en: "wg obfuscation: random bytes prepended to handshake Init packets (0-64). unset = built-in default; 0 = no padding for this field."
+    zh-CN: "wg 混淆：握手 Init 包前随机填充字节数（0-64）。未设置=使用内置默认值；显式 0=该字段不填充。"
+  wg_obfs_s2:
+    en: "wg obfuscation: random bytes prepended to handshake Response packets (0-64). unset = built-in default; 0 = no padding."
+    zh-CN: "wg 混淆：握手 Response 包前随机填充字节数（0-64）。未设置=使用内置默认值；显式 0=不填充。"
+  wg_obfs_s3:
+    en: "wg obfuscation: random bytes prepended to Cookie Reply packets (0-64). unset = built-in default; 0 = no padding."
+    zh-CN: "wg 混淆：Cookie Reply 包前随机填充字节数（0-64）。未设置=使用内置默认值；显式 0=不填充。"
+  wg_obfs_s4:
+    en: "wg obfuscation: random bytes appended to data packets (0-32). unset = built-in default; 0 = no padding."
+    zh-CN: "wg 混淆：Data 包尾追加的随机字节数（0-32）。未设置=使用内置默认值；显式 0=不追加。"
+  wg_obfs_jc:
+    en: "wg obfuscation: number of junk packets sent before the handshake (0-10). unset = built-in default; 0 = none."
+    zh-CN: "wg 混淆：握手前发送的 junk 包数量（0-10）。未设置=使用内置默认值；显式 0=不发送。"
+  wg_obfs_jmin:
+    en: "wg obfuscation: minimum junk packet size (must not collide with 148+s1 / 92+s2 / 64+s3). unset = built-in default."
+    zh-CN: "wg 混淆：junk 包最小长度（不得与 148+S1 / 92+S2 / 64+S3 重合）。未设置=使用内置默认值。"
+  wg_obfs_jmax:
+    en: "wg obfuscation: maximum junk packet size (must not collide with 148+s1 / 92+s2 / 64+s3). unset = built-in default."
+    zh-CN: "wg 混淆：junk 包最大长度（不得与 148+S1 / 92+S2 / 64+S3 重合）。未设置=使用内置默认值。"
   private_mode:
     en: "if true, foreign networks are only allowed when this node can verify they use the same network secret, or when a foreign credential node is already trusted via admin-issued credential propagation; different or missing secrets are otherwise rejected."
     zh-CN: "如果为true，则仅允许两类 foreign network 接入：本节点能验证其使用相同 network secret 的节点，或已通过 foreign network 管理节点传播而被信任的 credential 节点；否则 secret 不同或缺失时会被拒绝。"

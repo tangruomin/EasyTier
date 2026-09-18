@@ -76,6 +76,14 @@ pub fn gen_default_flags() -> Flags {
         dns_mode: DnsMode::Auto.to_string(),
         dns_servers: Vec::new(),
         disable_exit_dns: false,
+        wg_obfs: None,
+        wg_obfs_s1: None,
+        wg_obfs_s2: None,
+        wg_obfs_s3: None,
+        wg_obfs_s4: None,
+        wg_obfs_jc: None,
+        wg_obfs_jmin: None,
+        wg_obfs_jmax: None,
     }
 }
 

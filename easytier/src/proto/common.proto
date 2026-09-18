@@ -89,6 +89,19 @@ message FlagsInConfig {
 
   // 出口节点是否禁止提供隧道内 DNS 服务（默认 false，即出口节点默认提供）
   bool disable_exit_dns = 45;
+
+  // ===== WG 混淆（抗封锁，AmneziaWG 式；默认关闭）=====
+  // 总开关：默认 false，保持原生 WireGuard 行为（与旧版本 / 公网服务器 wg 互通）。
+  // 开启后两端必须使用完全相同的混淆参数，否则无法握手（这是预期行为）。
+  optional bool wg_obfs = 46;
+  // 以下 7 个参数：未设置 = 使用代码内置默认值；显式设为 0 = 该字段不做填充 / 不发送 junk。
+  optional uint32 wg_obfs_s1 = 47; // 握手 Init 包前随机填充字节数
+  optional uint32 wg_obfs_s2 = 48; // 握手 Response 包前随机填充字节数
+  optional uint32 wg_obfs_s3 = 49; // Cookie Reply 包前随机填充字节数
+  optional uint32 wg_obfs_s4 = 50; // Data 包尾追加随机字节数
+  optional uint32 wg_obfs_jc = 51; // 连接建立前发送的 junk 包数量
+  optional uint32 wg_obfs_jmin = 52; // junk 包最小长度
+  optional uint32 wg_obfs_jmax = 53; // junk 包最大长度
 }
 
 message RpcDescriptor {

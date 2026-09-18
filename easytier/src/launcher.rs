@@ -844,6 +844,31 @@ impl NetworkConfig {
             flags.disable_exit_dns = disable_exit_dns;
         }
 
+        if let Some(wg_obfs) = self.wg_obfs {
+            flags.wg_obfs = Some(wg_obfs);
+        }
+        if let Some(v) = self.wg_obfs_s1 {
+            flags.wg_obfs_s1 = Some(v);
+        }
+        if let Some(v) = self.wg_obfs_s2 {
+            flags.wg_obfs_s2 = Some(v);
+        }
+        if let Some(v) = self.wg_obfs_s3 {
+            flags.wg_obfs_s3 = Some(v);
+        }
+        if let Some(v) = self.wg_obfs_s4 {
+            flags.wg_obfs_s4 = Some(v);
+        }
+        if let Some(v) = self.wg_obfs_jc {
+            flags.wg_obfs_jc = Some(v);
+        }
+        if let Some(v) = self.wg_obfs_jmin {
+            flags.wg_obfs_jmin = Some(v);
+        }
+        if let Some(v) = self.wg_obfs_jmax {
+            flags.wg_obfs_jmax = Some(v);
+        }
+
         if let Some(mtu) = self.mtu {
             flags.mtu = mtu as u32;
         }
@@ -1017,6 +1042,14 @@ impl NetworkConfig {
         result.dns_mode = Some(flags.dns_mode.clone());
         result.dns_servers = flags.dns_servers.clone();
         result.disable_exit_dns = Some(flags.disable_exit_dns);
+        result.wg_obfs = flags.wg_obfs;
+        result.wg_obfs_s1 = flags.wg_obfs_s1;
+        result.wg_obfs_s2 = flags.wg_obfs_s2;
+        result.wg_obfs_s3 = flags.wg_obfs_s3;
+        result.wg_obfs_s4 = flags.wg_obfs_s4;
+        result.wg_obfs_jc = flags.wg_obfs_jc;
+        result.wg_obfs_jmin = flags.wg_obfs_jmin;
+        result.wg_obfs_jmax = flags.wg_obfs_jmax;
         result.mtu = Some(flags.mtu as i32);
         result.instance_recv_bps_limit =
             (flags.instance_recv_bps_limit != u64::MAX).then_some(flags.instance_recv_bps_limit);

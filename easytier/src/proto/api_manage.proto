@@ -108,6 +108,16 @@ message NetworkConfig {
   repeated string dns_servers = 68;
   // 出口节点是否禁止提供隧道内 DNS 服务（默认 false，即默认提供）
   optional bool disable_exit_dns = 69;
+
+  // ===== WG 混淆（抗封锁，AmneziaWG 式；默认关闭）=====
+  optional bool wg_obfs = 70;
+  optional uint32 wg_obfs_s1 = 71;
+  optional uint32 wg_obfs_s2 = 72;
+  optional uint32 wg_obfs_s3 = 73;
+  optional uint32 wg_obfs_s4 = 74;
+  optional uint32 wg_obfs_jc = 75;
+  optional uint32 wg_obfs_jmin = 76;
+  optional uint32 wg_obfs_jmax = 77;
 }
 
 message PortForwardConfig {

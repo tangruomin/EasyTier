@@ -618,6 +618,36 @@ struct NetworkOptions {
     disable_exit_dns: Option<bool>,
 
     #[arg(
+        long = "wg-obfs",
+        env = "ET_WG_OBFS",
+        help = t!("core_clap.wg_obfs").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    wg_obfs: Option<bool>,
+
+    #[arg(long = "wg-obfs-s1", env = "ET_WG_OBFS_S1", help = t!("core_clap.wg_obfs_s1").to_string())]
+    wg_obfs_s1: Option<u32>,
+
+    #[arg(long = "wg-obfs-s2", env = "ET_WG_OBFS_S2", help = t!("core_clap.wg_obfs_s2").to_string())]
+    wg_obfs_s2: Option<u32>,
+
+    #[arg(long = "wg-obfs-s3", env = "ET_WG_OBFS_S3", help = t!("core_clap.wg_obfs_s3").to_string())]
+    wg_obfs_s3: Option<u32>,
+
+    #[arg(long = "wg-obfs-s4", env = "ET_WG_OBFS_S4", help = t!("core_clap.wg_obfs_s4").to_string())]
+    wg_obfs_s4: Option<u32>,
+
+    #[arg(long = "wg-obfs-jc", env = "ET_WG_OBFS_JC", help = t!("core_clap.wg_obfs_jc").to_string())]
+    wg_obfs_jc: Option<u32>,
+
+    #[arg(long = "wg-obfs-jmin", env = "ET_WG_OBFS_JMIN", help = t!("core_clap.wg_obfs_jmin").to_string())]
+    wg_obfs_jmin: Option<u32>,
+
+    #[arg(long = "wg-obfs-jmax", env = "ET_WG_OBFS_JMAX", help = t!("core_clap.wg_obfs_jmax").to_string())]
+    wg_obfs_jmax: Option<u32>,
+
+    #[arg(
         long,
         env = "ET_PRIVATE_MODE",
         help = t!("core_clap.private_mode").to_string(),
@@ -1191,6 +1221,31 @@ impl NetworkOptions {
             f.dns_servers = self.dns_servers.clone();
         }
         f.disable_exit_dns = self.disable_exit_dns.unwrap_or(f.disable_exit_dns);
+        // WG 混淆：总开关 + 7 个可选参数（未指定则保持 None = 使用代码内置默认值）
+        if let Some(v) = self.wg_obfs {
+            f.wg_obfs = Some(v);
+        }
+        if let Some(v) = self.wg_obfs_s1 {
+            f.wg_obfs_s1 = Some(v);
+        }
+        if let Some(v) = self.wg_obfs_s2 {
+            f.wg_obfs_s2 = Some(v);
+        }
+        if let Some(v) = self.wg_obfs_s3 {
+            f.wg_obfs_s3 = Some(v);
+        }
+        if let Some(v) = self.wg_obfs_s4 {
+            f.wg_obfs_s4 = Some(v);
+        }
+        if let Some(v) = self.wg_obfs_jc {
+            f.wg_obfs_jc = Some(v);
+        }
+        if let Some(v) = self.wg_obfs_jmin {
+            f.wg_obfs_jmin = Some(v);
+        }
+        if let Some(v) = self.wg_obfs_jmax {
+            f.wg_obfs_jmax = Some(v);
+        }
         cfg.set_flags(f);
 
         if !self.exit_nodes.is_empty() {
