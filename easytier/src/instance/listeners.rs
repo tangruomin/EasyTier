@@ -33,12 +33,14 @@ pub fn create_listener_by_url(
             IpScheme::Udp => UdpTunnelListener::new(l.clone()).boxed(),
             #[cfg(feature = "wireguard")]
             IpScheme::Wg => {
-                use crate::tunnel::wireguard::{WgConfig, WgTunnelListener};
+                use crate::tunnel::wireguard::{WgConfig, WgObfsConfig, WgTunnelListener};
                 let nid = global_ctx.get_network_identity();
                 let wg_config = WgConfig::new_from_network_identity(
                     &nid.network_name,
                     &nid.network_secret.unwrap_or_default(),
-                );
+                )
+                // WG 混淆参数：未开启（默认）时为 None，保持原生 WireGuard 行为
+                .with_obfs(WgObfsConfig::from_flags(&global_ctx.get_flags()));
                 WgTunnelListener::new(l.clone(), wg_config).boxed()
             }
             #[cfg(feature = "quic")]

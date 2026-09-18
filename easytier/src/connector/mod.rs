@@ -252,12 +252,14 @@ pub async fn create_connector_by_url(
                 }
                 #[cfg(feature = "wireguard")]
                 IpScheme::Wg => {
-                    use crate::tunnel::wireguard::{WgConfig, WgTunnelConnector};
+                    use crate::tunnel::wireguard::{WgConfig, WgObfsConfig, WgTunnelConnector};
                     let nid = global_ctx.get_network_identity();
                     let wg_config = WgConfig::new_from_network_identity(
                         &nid.network_name,
                         &nid.network_secret.unwrap_or_default(),
-                    );
+                    )
+                    // WG 混淆参数：未开启（默认）时为 None，保持原生 WireGuard 行为
+                    .with_obfs(WgObfsConfig::from_flags(&global_ctx.get_flags()));
                     // 注入 global_ctx：wg connector 需要据此区分"目标是物理地址"还是
                     // "目标是虚拟网地址"，前者只允许直连、不允许复用外层隧道（防回环）
                     WgTunnelConnector::new_with_global_ctx(url, wg_config, Some(global_ctx.clone()))
