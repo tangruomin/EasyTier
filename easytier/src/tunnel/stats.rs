@@ -59,6 +59,17 @@ impl WindowLatency {
             (T::from(sum)) / T::from(count)
         }
     }
+
+    /// 当前已记录的有效延迟采样次数（窗口内，上限为 `latency_us_window_size`）。
+    ///
+    /// 注意：这里**不修改** `get_latency_us()` 的既有语义（无采样时返回 0）。
+    /// 该函数被 `easytier-cli peer` 的 lat(ms) 列等展示路径复用，若把“无采样”
+    /// 改成 `u32::MAX` 会显示成 4294967ms，破坏可读性。
+    /// 数据面选路（`Peer::select_conn`）需要区分“延迟真的是 0”与“还没有采样”，
+    /// 因此改为调用本方法判断，而不是依赖延迟值本身。
+    pub fn sample_count(&self) -> u32 {
+        self.count.load(Relaxed)
+    }
 }
 
 #[derive(Debug)]

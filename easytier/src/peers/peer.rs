@@ -27,6 +27,57 @@ use tokio_util::task::AbortOnDropHandle;
 type ArcPeerConn = Arc<PeerConn>;
 type ConnMap = Arc<DashMap<PeerConnId, ArcPeerConn>>;
 
+/// 数据面选路的候选项：把 `PeerConn` 中参与挑选的字段抽出来，
+/// 使挑选逻辑成为不依赖真实 tunnel 的纯函数，便于单元测试
+/// （构造真实 `PeerConn` 需要 ring tunnel + 握手，成本高且易碎）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DataPathCandidate {
+    conn_id: PeerConnId,
+    /// 连接已关闭，不能再用于发送
+    is_closed: bool,
+    /// 协议已上报“数据面就绪”（默认 true，见 `PeerConn::is_ready_for_data`）
+    ready_for_data: bool,
+    /// 是否已有真实延迟采样；无采样时 `latency_us` 恒为 0，绝不代表“最快”
+    has_latency_sample: bool,
+    latency_us: u64,
+}
+
+impl DataPathCandidate {
+    /// 是否可作为数据面候选：未关闭且协议认为已就绪。
+    fn is_eligible(&self) -> bool {
+        !self.is_closed && self.ready_for_data
+    }
+}
+
+/// 从候选中挑选默认数据面连接，返回被选中的 `conn_id`。
+///
+/// 规则：
+/// 1. 只考虑未关闭且 `ready_for_data == true` 的连接；
+/// 2. 在有延迟采样的候选里选延迟最小的一条（`<` 比较，保持原有“先到先得”的稳定性）；
+/// 3. 若一条有采样的候选都没有（例如刚建连、pingpong 还没跑完），
+///    回退到第一条可用候选，避免“一条都不选”导致数据面死锁；
+/// 4. 若没有任何可用候选（全部关闭 / 全部未就绪），返回 `None`
+///    （`Peer::send_msg` 会转成 `PeerNoConnectionError`，行为正确）。
+///
+/// 关键点：**不把“无延迟采样”当成“延迟 0”**，否则刚加入的连接（尤其是握手未完成、
+/// 实际不可用的半连接）会凭 0 延迟抢占该 peer 的默认数据面，把整条路径的流量带进黑洞。
+fn pick_default_conn(candidates: &[DataPathCandidate]) -> Option<PeerConnId> {
+    let mut best_sampled: Option<&DataPathCandidate> = None;
+    let mut fallback: Option<&DataPathCandidate> = None;
+
+    for candidate in candidates.iter().filter(|c| c.is_eligible()) {
+        if candidate.has_latency_sample {
+            if best_sampled.is_none_or(|best| candidate.latency_us < best.latency_us) {
+                best_sampled = Some(candidate);
+            }
+        } else if fallback.is_none() {
+            fallback = Some(candidate);
+        }
+    }
+
+    best_sampled.or(fallback).map(|c| c.conn_id)
+}
+
 pub struct Peer {
     pub peer_node_id: PeerId,
     conns: ConnMap,
@@ -187,24 +238,41 @@ impl Peer {
     }
 
     async fn select_conn(&self) -> Option<ArcPeerConn> {
+        // 1. 缓存的默认连接仍然“可用”时优先复用，避免每次发包都重新比较造成的抖动。
+        //    注意：必须校验状态，否则已关闭 / 尚未就绪的连接会被一直沿用。
         let default_conn_id = self.default_conn_id.load();
-        if let Some(conn) = self.conns.get(&default_conn_id) {
+        if let Some(conn) = self.conns.get(&default_conn_id)
+            && Self::is_conn_eligible_for_data(conn.value())
+        {
             return Some(conn.clone());
         }
 
-        // find a conn with the smallest latency
-        let mut min_latency = u64::MAX;
-        for conn in self.conns.iter() {
-            let latency = conn.value().get_stats().latency_us;
-            if latency < min_latency {
-                min_latency = latency;
-                self.default_conn_id.store(conn.get_conn_id());
-            }
-        }
+        // 2. 收集候选项。这里只把参与挑选的字段拷贝出来，不要在持有 DashMap 迭代器
+        //    期间再调用 self.conns.get()（会死锁）。
+        let candidates: Vec<DataPathCandidate> = self
+            .conns
+            .iter()
+            .map(|entry| {
+                let conn = entry.value();
+                DataPathCandidate {
+                    conn_id: conn.get_conn_id(),
+                    is_closed: conn.is_closed(),
+                    ready_for_data: conn.is_ready_for_data(),
+                    has_latency_sample: conn.has_latency_sample(),
+                    latency_us: conn.get_stats().latency_us,
+                }
+            })
+            .collect();
 
-        self.conns
-            .get(&self.default_conn_id.load())
-            .map(|conn| conn.clone())
+        // 3. 统一由纯函数挑选：跳过已关闭 / 未就绪的连接，且不把“无采样”当成“延迟 0”。
+        let selected_conn_id = pick_default_conn(&candidates)?;
+        self.default_conn_id.store(selected_conn_id);
+        self.conns.get(&selected_conn_id).map(|conn| conn.clone())
+    }
+
+    /// 连接是否可以参与数据面选路：未关闭且协议已上报“数据面就绪”。
+    fn is_conn_eligible_for_data(conn: &PeerConn) -> bool {
+        !conn.is_closed() && conn.is_ready_for_data()
     }
 
     pub async fn send_msg(&self, msg: ZCPacket) -> Result<(), Error> {
@@ -302,12 +370,16 @@ mod tests {
             global_ctx::{GlobalCtx, tests::get_mock_global_ctx},
             new_peer_id,
         },
-        peers::{create_packet_recv_chan, peer_conn::PeerConn, peer_session::PeerSessionStore},
+        peers::{
+            create_packet_recv_chan,
+            peer_conn::{PeerConn, PeerConnId},
+            peer_session::PeerSessionStore,
+        },
         proto::common::SecureModeConfig,
         tunnel::ring::create_ring_tunnel_pair,
     };
 
-    use super::Peer;
+    use super::{DataPathCandidate, Peer, pick_default_conn};
 
     fn set_secure_mode_cfg(global_ctx: &GlobalCtx, enabled: bool) {
         if !enabled {
@@ -562,5 +634,148 @@ mod tests {
         assert_eq!(peer.get_peer_public_key(), Some(pubkey_1));
         let ret = peer.add_peer_conn(client_conn_2).await;
         assert!(ret.is_err());
+    }
+
+    /// 构造一个测试用候选连接。
+    fn test_candidate(
+        conn_id: u128,
+        latency_us: u64,
+        has_latency_sample: bool,
+        ready_for_data: bool,
+    ) -> DataPathCandidate {
+        DataPathCandidate {
+            conn_id: uuid::Uuid::from_u128(conn_id),
+            is_closed: false,
+            ready_for_data,
+            has_latency_sample,
+            latency_us,
+        }
+    }
+
+    /// 建一对已握手、已各自加入 Peer 的连接，返回
+    /// (本地 Peer, 远端 Peer, 本地 conn_id)。远端 Peer 需由调用方持有，
+    /// 否则连接会被提前关闭。`ready_for_data` 在加入 Peer 之前设置。
+    async fn setup_peer_with_one_conn(ready_for_data: bool) -> (Peer, Peer, PeerConnId) {
+        let (local_packet_send, _local_packet_recv) = create_packet_recv_chan();
+        let (remote_packet_send, _remote_packet_recv) = create_packet_recv_chan();
+        let global_ctx = get_mock_global_ctx();
+        let local_peer = Peer::new(new_peer_id(), local_packet_send, global_ctx.clone());
+        let remote_peer = Peer::new(new_peer_id(), remote_packet_send, global_ctx.clone());
+        let ps = Arc::new(PeerSessionStore::new());
+
+        let (local_tunnel, remote_tunnel) = create_ring_tunnel_pair();
+        let mut local_conn = PeerConn::new(
+            local_peer.peer_node_id,
+            global_ctx.clone(),
+            local_tunnel,
+            ps.clone(),
+        );
+        let mut remote_conn = PeerConn::new(
+            remote_peer.peer_node_id,
+            global_ctx.clone(),
+            remote_tunnel,
+            ps.clone(),
+        );
+
+        let (client_ret, server_ret) = tokio::join!(
+            local_conn.do_handshake_as_client(),
+            remote_conn.do_handshake_as_server()
+        );
+        client_ret.unwrap();
+        server_ret.unwrap();
+
+        let conn_id = local_conn.get_conn_id();
+        // 默认必须是 true（保证 tcp/udp/ws 等既有协议行为不变）
+        assert!(local_conn.is_ready_for_data());
+        assert!(!local_conn.has_latency_sample());
+        local_conn.set_ready_for_data(ready_for_data);
+
+        local_peer.add_peer_conn(local_conn).await.unwrap();
+        remote_peer.add_peer_conn(remote_conn).await.unwrap();
+
+        (local_peer, remote_peer, conn_id)
+    }
+
+    /// 用例 1：一条“有真实延迟采样”的连接 + 一条“新加入、无采样（延迟记为 0）”的连接
+    /// → 必须选中前者，且与遍历顺序无关。
+    #[test]
+    fn select_conn_prefers_conn_with_real_latency_sample() {
+        let sampled = test_candidate(1, 5_000, true, true);
+        let fresh = test_candidate(2, 0, false, true);
+
+        assert_eq!(pick_default_conn(&[sampled, fresh]), Some(sampled.conn_id));
+        assert_eq!(pick_default_conn(&[fresh, sampled]), Some(sampled.conn_id));
+
+        // 多条都有采样时，仍然选延迟最小的一条
+        let slower = test_candidate(3, 80_000, true, true);
+        assert_eq!(
+            pick_default_conn(&[slower, sampled, fresh]),
+            Some(sampled.conn_id)
+        );
+    }
+
+    /// 用例 2：唯一一条连接未就绪 → 必须返回 None（交给 `PeerNoConnectionError`）；
+    /// 已关闭的连接同样不可用；但“唯一一条就绪、只是还没采样”必须回退选中它。
+    #[test]
+    fn select_conn_returns_none_when_only_conn_is_not_usable() {
+        let unready = test_candidate(1, 0, false, false);
+        assert_eq!(pick_default_conn(&[unready]), None);
+
+        let closed = DataPathCandidate {
+            is_closed: true,
+            ..test_candidate(2, 1_000, true, true)
+        };
+        assert_eq!(pick_default_conn(&[closed]), None);
+
+        // 边界：全都没采样时回退到第一条可用连接，不能“一条都不选”
+        let fresh_a = test_candidate(3, 0, false, true);
+        let fresh_b = test_candidate(4, 0, false, true);
+        assert_eq!(
+            pick_default_conn(&[fresh_a, fresh_b]),
+            Some(fresh_a.conn_id)
+        );
+    }
+
+    /// 用例 3：`ready_for_data == true` 的连接优先级不被 `false` 的连接抢占
+    /// （即便后者延迟更低或更“新鲜”）。
+    #[test]
+    fn select_conn_never_picks_not_ready_conn() {
+        let ready_sampled = test_candidate(1, 20_000, true, true);
+        let unready_faster = test_candidate(2, 1_000, true, false);
+        assert_eq!(
+            pick_default_conn(&[ready_sampled, unready_faster]),
+            Some(ready_sampled.conn_id)
+        );
+
+        // 就绪但无采样 vs 未就绪但有采样：仍然选就绪的那条
+        let ready_fresh = test_candidate(3, 0, false, true);
+        let unready_sampled = test_candidate(4, 1_000, true, false);
+        assert_eq!(
+            pick_default_conn(&[ready_fresh, unready_sampled]),
+            Some(ready_fresh.conn_id)
+        );
+
+        // 全部未就绪 / 空集合 → None
+        assert_eq!(pick_default_conn(&[unready_faster, unready_sampled]), None);
+        assert_eq!(pick_default_conn(&[]), None);
+    }
+
+    /// 真实连接对象级别的最小回归：验证 `ready_for_data` 落在 `PeerConn` 上、
+    /// 默认 true、accessor 可用，并且 `Peer::select_conn()` 确实按该标志过滤。
+    ///
+    /// 取舍：往真实连接里注入“延迟采样”需要让 pingpong 真正跑起来（依赖远端
+    /// 应答与定时器），测试会不稳定；因此“无采样不得当成延迟 0”的判定放在上面的
+    /// 纯函数用例里覆盖，这里只验证标志的承载与过滤接线。
+    #[tokio::test]
+    async fn select_conn_respects_ready_for_data_flag() {
+        // 默认 ready=true：唯一一条连接即使还没采样也必须被选中（回退语义）
+        let (local_peer, _remote_peer, conn_id) = setup_peer_with_one_conn(true).await;
+        let selected = local_peer.select_conn().await.expect("就绪连接应被选中");
+        assert_eq!(selected.get_conn_id(), conn_id);
+        assert!(selected.is_ready_for_data());
+
+        // ready=false：唯一一条连接被 select_conn 过滤 → None
+        let (local_peer, _remote_peer, _conn_id) = setup_peer_with_one_conn(false).await;
+        assert!(local_peer.select_conn().await.is_none());
     }
 }

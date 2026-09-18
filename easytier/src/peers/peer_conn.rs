@@ -6,7 +6,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
 
@@ -306,6 +306,14 @@ pub struct PeerConn {
     // remote or local
     is_hole_punched: bool,
 
+    /// 数据面就绪标志（承载 + 查询，本任务不负责各协议上报）。
+    ///
+    /// 默认 `true`，以保证 tcp/udp/ws 等既有协议的行为完全不变；
+    /// 需要额外确认可用性的协议（例如握手未完成、可能被 DPI 丢弃的 wg 半连接）
+    /// 应在确认可用前 `set_ready_for_data(false)`。
+    /// `Peer::select_conn()` 只会遍历 `true` 的连接，避免不可用连接抢占默认数据面。
+    ready_for_data: AtomicBool,
+
     close_event_notifier: Arc<PeerConnCloseNotify>,
 
     ctrl_resp_sender: broadcast::Sender<ZCPacket>,
@@ -394,6 +402,8 @@ impl PeerConn {
 
             is_hole_punched: true,
 
+            ready_for_data: AtomicBool::new(true),
+
             close_event_notifier: Arc::new(PeerConnCloseNotify::new(conn_id)),
 
             ctrl_resp_sender: ctrl_sender,
@@ -444,6 +454,29 @@ impl PeerConn {
 
     pub fn is_closed(&self) -> bool {
         self.close_event_notifier.is_closed()
+    }
+
+    /// 设置“数据面就绪”标志。
+    ///
+    /// 置为 `false` 只会让 `Peer::select_conn()` 跳过本连接，不影响握手、
+    /// RPC、心跳等控制面流程，也不会主动关闭连接。
+    pub fn set_ready_for_data(&self, ready: bool) {
+        self.ready_for_data.store(ready, Ordering::Relaxed);
+    }
+
+    /// 本连接当前是否可用于承载数据面流量。
+    pub fn is_ready_for_data(&self) -> bool {
+        self.ready_for_data.load(Ordering::Relaxed)
+    }
+
+    /// 本连接是否至少记录过一次真实延迟采样。
+    ///
+    /// `WindowLatency::get_latency_us()` 在无采样时返回 0（为保持 CLI 展示语义而
+    /// 特意保留），直接拿它做“最小延迟”比较会让刚加入、尚无采样的连接被误判为
+    /// “最优”，从而抢占默认数据面。选路时必须用本方法区分
+    /// “延迟真的是 0”与“还没有采样”。
+    pub fn has_latency_sample(&self) -> bool {
+        self.latency_stats.sample_count() > 0
     }
 
     async fn wait_handshake(&self, need_retry: &mut bool) -> Result<HandshakeRequest, Error> {
