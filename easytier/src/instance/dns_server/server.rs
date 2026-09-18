@@ -151,6 +151,27 @@ impl Server {
                 .contains(&x.socket_addr.ip())
         });
 
+        // 兜底：排除假 IP 之后上游列表可能变成空的（Windows 上 easytier 会把 TUN 的 DNS 设成
+        // 100.100.100.101，若系统里只剩它一个，就会被全部过滤掉），此时 ForwardAuthority 没有任何
+        // 上游 → 所有外部域名查询直接失败。这里显式兜底，保证**永远不会出现"零上游"**。
+        if name_servers.is_empty() {
+            let fallback: Vec<NameServerConfig> = if config.fallback_forward_upstreams().is_empty()
+            {
+                default_forward_resolver_config().name_servers().to_vec()
+            } else {
+                config
+                    .fallback_forward_upstreams()
+                    .iter()
+                    .map(|addr| NameServerConfig::new(*addr, Protocol::Udp))
+                    .collect()
+            };
+            tracing::warn!(
+                upstreams = ?fallback.iter().map(|x| x.socket_addr).collect::<Vec<_>>(),
+                "all system dns servers were excluded (magic dns fake ip), fall back to default upstream"
+            );
+            name_servers = fallback;
+        }
+
         let forward_config = ForwardConfig {
             name_servers: name_servers.into(),
             options: Some(options),

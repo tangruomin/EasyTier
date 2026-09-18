@@ -28,7 +28,76 @@ use once_cell::sync::Lazy;
 use crate::peers::peer_manager::PeerManager;
 
 /// 单次向出口节点 DNS 服务查询的超时时间（UDP/TCP 各自计算）。
-const EXIT_DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+///
+/// 这个超时时间**直接决定魔法 DNS 的最坏延迟**：`handle_udp_packet` 是在 NIC 包处理管线里
+/// **同步**调用本模块的（管线串行处理 TUN 收包），所以这里的每一次超时都会让整条数据面
+/// 停顿同样长的时间。因此取一个"足够覆盖海外出口一次 DNS 往返"的保守小值（实测日本出口
+/// ~80-100ms），而不是最初写死的 2 秒——那会在出口不可用时把 TUN 数据面堵死
+/// （真机现象：开启 accept_dns 后整机断网，详见 `easytier-WG混淆与连接生命周期-方案评审.md`）。
+const EXIT_DNS_QUERY_TIMEOUT: Duration = Duration::from_millis(400);
+
+/// 熔断阈值：连续失败多少次后，暂停使用出口 DNS。
+const EXIT_DNS_BREAKER_FAIL_THRESHOLD: u32 = 3;
+/// 熔断时长：暂停期间所有查询直接回退本机上游，**不再产生任何网络等待**。
+const EXIT_DNS_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// 出口 DNS 熔断器状态。
+struct BreakerState {
+    consecutive_failures: u32,
+    unusable_until: Option<Instant>,
+}
+
+/// 出口 DNS 的熔断器（进程级）。
+///
+/// 目的：出口节点不可达（被墙 / 掉线 / 参数不一致）时，不能让**每个** DNS 查询都白等一次
+/// 超时并阻塞 NIC 管线；连续失败后直接跳过出口路径，隔一段时间再放行一次探测。
+static EXIT_DNS_BREAKER: Lazy<Mutex<BreakerState>> = Lazy::new(|| {
+    Mutex::new(BreakerState {
+        consecutive_failures: 0,
+        unusable_until: None,
+    })
+});
+
+/// 熔断器是否放行（不产生网络等待）。
+fn breaker_allows() -> bool {
+    let Ok(mut st) = EXIT_DNS_BREAKER.lock() else {
+        return true;
+    };
+    match st.unusable_until {
+        Some(until) if until > Instant::now() => false,
+        Some(_) => {
+            // 冷却结束：放行一次探测
+            st.unusable_until = None;
+            st.consecutive_failures = 0;
+            true
+        }
+        None => true,
+    }
+}
+
+/// 记录一次失败；达到阈值则进入冷却。
+fn breaker_record_failure() {
+    let Ok(mut st) = EXIT_DNS_BREAKER.lock() else {
+        return;
+    };
+    st.consecutive_failures = st.consecutive_failures.saturating_add(1);
+    if st.consecutive_failures >= EXIT_DNS_BREAKER_FAIL_THRESHOLD {
+        st.unusable_until = Some(Instant::now() + EXIT_DNS_BREAKER_COOLDOWN);
+        tracing::warn!(
+            cooldown_secs = EXIT_DNS_BREAKER_COOLDOWN.as_secs(),
+            "exit node dns keeps failing, disable it temporarily and use local upstream"
+        );
+    }
+}
+
+/// 记录一次成功（重置熔断器）。
+fn breaker_record_success() {
+    let Ok(mut st) = EXIT_DNS_BREAKER.lock() else {
+        return;
+    };
+    st.consecutive_failures = 0;
+    st.unusable_until = None;
+}
 
 /// DNS 应答缓存的最大条目数（超过后整体清空，避免无限增长）。
 const DNS_CACHE_MAX_ENTRIES: usize = 512;
@@ -221,6 +290,12 @@ async fn query_exit_dns_tcp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>, S
 /// 尝试经隧道把外部域名查询交给出口节点解析。
 ///
 /// 返回 `None` 表示"无法经出口解析"，调用方必须回退到本机上游。
+///
+/// **重要约束**：本函数是被 NIC 包处理管线**同步**调用的，管线串行处理 TUN 收包，
+/// 因此这里绝不能长时间阻塞。所以：
+/// * 命中缓存立即返回；
+/// * 熔断期内（出口 DNS 连续失败）直接返回 `None`，**零网络等待**；
+/// * 单次查询最多等 [`EXIT_DNS_QUERY_TIMEOUT`]（400ms）。
 pub async fn resolve_external_query(peer_mgr: &Arc<PeerManager>, query: &[u8]) -> Option<Vec<u8>> {
     if !can_reach_tunnel_dns() {
         tracing::trace!("skip exit node dns resolving on this platform");
@@ -230,6 +305,12 @@ pub async fn resolve_external_query(peer_mgr: &Arc<PeerManager>, query: &[u8]) -
     if let Some(cached) = lookup_cache(query) {
         tracing::trace!("magic dns cache hit");
         return Some(cached);
+    }
+
+    // 熔断：出口 DNS 连续失败后，冷却期内不再产生任何等待（避免阻塞 NIC 管线）
+    if !breaker_allows() {
+        tracing::trace!("exit node dns is in cooldown, use local upstream directly");
+        return None;
     }
 
     let exit_ip = match select_online_exit_ip(peer_mgr.as_ref()).await {
@@ -242,6 +323,7 @@ pub async fn resolve_external_query(peer_mgr: &Arc<PeerManager>, query: &[u8]) -
 
     match query_exit_dns_service(exit_ip, query).await {
         Ok(mut response) => {
+            breaker_record_success();
             if !peer_mgr.get_global_ctx().enable_ipv6_addr()
                 && let Some(stripped) = strip_aaaa_records(&response)
             {
@@ -253,6 +335,7 @@ pub async fn resolve_external_query(peer_mgr: &Arc<PeerManager>, query: &[u8]) -
             Some(response)
         }
         Err(e) => {
+            breaker_record_failure();
             tracing::warn!(
                 ?exit_ip,
                 error = %e,
